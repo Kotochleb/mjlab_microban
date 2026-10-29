@@ -35,5 +35,10 @@ name = "better-actuator-models"
 version = "1.0.0"
 requires-dist = ["numpy", "colorama"]
 
+# rsl_rl passes wandb.Settings(start_method=...), which some wandb releases
+# reject (pydantic extra_forbidden). 0.25.0 accepts it as a deprecated no-op.
+[tool.uv]
+override-dependencies = ["wandb==0.25.0"]
+
 [tool.uv.sources]
 better-actuator-models = { git = "ssh://git@github.com/rhoban/bam", branch = "doc" }
