@@ -15,6 +15,7 @@ from mjlab.envs.mdp import dr
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.observation_manager import ObservationGroupCfg
+from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import ContactMatch, ContactSensorCfg
 from mjlab.tasks.tracking.mdp import MotionCommandCfg
@@ -22,6 +23,7 @@ from mjlab.tasks.tracking.tracking_env_cfg import make_tracking_env_cfg
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 
 from mjlab_microban.robot.microban_constants import MICROBAN_ROBOT_CFG
+from mjlab_microban.tasks.tracking import mdp
 
 # Microban is roughly 4x smaller than the G1 the base tracking config was tuned
 # for, so position-based stds, thresholds and ranges are scaled down accordingly.
@@ -105,14 +107,28 @@ def make_microban_tracking_env_cfg(
     cfg.observations["actor"].terms["base_lin_vel"].noise = Unoise(n_min=-0.15, n_max=0.15)
 
     #---------------------------- Rewards ---------------------------
-    cfg.rewards["motion_global_root_pos"].params["std"] = 0.08
-    cfg.rewards["motion_body_pos"].params["std"] = 0.08
+    # Loosen tracking precision so the policy receives useful gradient from the
+    # start rather than near-zero signal when the initial error is large
+    # (0.7 on the full-size Kangaroo, scaled down for position terms).
+    cfg.rewards["motion_global_root_pos"].params["std"] = 0.18
+    cfg.rewards["motion_global_root_ori"].params["std"] = 0.7
+    cfg.rewards["motion_body_pos"].params["std"] = 0.18
+    cfg.rewards["motion_body_ori"].params["std"] = 0.7
     cfg.rewards["motion_body_pos"].params["body_names"] = END_EFFECTOR_BODY_NAMES
     cfg.rewards["motion_body_lin_vel"].params["std"] = 0.3
     cfg.rewards["motion_body_lin_vel"].params["body_names"] = END_EFFECTOR_BODY_NAMES
 
+    cfg.rewards["motion_global_root_lin_vel_z"] = RewardTermCfg(
+        func=mdp.motion_global_anchor_velocity_z_error_exp,
+        weight=1.0,
+        params={"command_name": "motion", "std": 0.3},
+    )
+
     cfg.rewards["motion_body_ori"].params["body_names"] = ("head",)
     cfg.rewards["motion_body_ang_vel"].params["body_names"] = ("head",)
+
+    # Reduce action-rate penalty so it does not crush exploration early on.
+    cfg.rewards["action_rate_l2"].weight = -1e-2
 
     cfg.rewards["self_collisions"].params["force_threshold"] = 1.0
 
