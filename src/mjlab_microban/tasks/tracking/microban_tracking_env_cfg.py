@@ -10,6 +10,8 @@
 
 from copy import deepcopy
 
+import numpy as np
+
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs.mdp import dr
 from mjlab.envs.mdp.actions import JointPositionActionCfg
@@ -17,7 +19,7 @@ from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.observation_manager import ObservationGroupCfg
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
-from mjlab.sensor import ContactMatch, ContactSensorCfg
+from mjlab.sensor import ContactMatch, ContactSensorCfg, ObjRef, RingPatternCfg, TerrainHeightSensorCfg
 from mjlab.tasks.tracking.mdp import MotionCommandCfg
 from mjlab.tasks.tracking.tracking_env_cfg import make_tracking_env_cfg
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
@@ -37,6 +39,12 @@ END_EFFECTOR_BODY_NAMES = FEET_BODY_NAMES + HANDS_BODY_NAMES
 # The anchor (trunk) has to be part of the motion command bodies. The policy
 # tracks the position of the feet and hands, and the orientation of the head.
 TRACKED_BODY_NAMES = ("trunk",) + END_EFFECTOR_BODY_NAMES + ("head",)
+
+FOOT_SITE_NAMES = ("left_foot", "right_foot")
+
+# Foot slip and swing height costs are only applied while the trunk is tilted
+# less than this from vertical.
+FOOT_COSTS_MAX_TILT = np.deg2rad(30.0)
 
 
 def make_microban_tracking_env_cfg(
@@ -68,7 +76,36 @@ def make_microban_tracking_env_cfg(
         num_slots=1,
         history_length=4,
     )
-    cfg.scene.sensors = (self_collision_sensor_cfg,)
+    feet_ground_sensor_cfg = ContactSensorCfg(
+        name="feet_ground_contact",
+        primary=ContactMatch(
+            mode="subtree",
+            pattern=r"^(foot|foot_2)$",
+            entity="robot",
+        ),
+        secondary=ContactMatch(mode="body", pattern="terrain"),
+        fields=("found", "force"),
+        reduce="netforce",
+        num_slots=1,
+        track_air_time=True,
+    )
+
+    foot_height_scan_cfg = TerrainHeightSensorCfg(
+        name="foot_height_scan",
+        frame=tuple(ObjRef(type="site", name=s, entity="robot") for s in FOOT_SITE_NAMES),
+        pattern=RingPatternCfg.single_ring(radius=0.04, num_samples=2),
+        ray_alignment="yaw",
+        max_distance=1.0,
+        exclude_parent_body=True,
+        include_geom_groups=(0,),
+        debug_vis=False,
+    )
+
+    cfg.scene.sensors = (
+        self_collision_sensor_cfg,
+        feet_ground_sensor_cfg,
+        foot_height_scan_cfg,
+    )
 
     #---------------------------- Actions ---------------------------
     joint_pos_action = cfg.actions["joint_pos"]
@@ -135,6 +172,27 @@ def make_microban_tracking_env_cfg(
     cfg.rewards["action_rate_l2"].weight = -1e-3
 
     cfg.rewards["self_collisions"].params["force_threshold"] = 1.0
+
+    # Same settings as the velocity task.
+    cfg.rewards["foot_slip"] = RewardTermCfg(
+        func=mdp.feet_slip_upright,
+        weight=-1.0,
+        params={
+            "sensor_name": feet_ground_sensor_cfg.name,
+            "max_tilt": FOOT_COSTS_MAX_TILT,
+            "asset_cfg": SceneEntityCfg("robot", site_names=FOOT_SITE_NAMES),
+        },
+    )
+    cfg.rewards["foot_swing_height"] = RewardTermCfg(
+        func=mdp.feet_swing_height_upright,
+        weight=-0.25,
+        params={
+            "sensor_name": feet_ground_sensor_cfg.name,
+            "height_sensor_name": foot_height_scan_cfg.name,
+            "target_height": 0.02,
+            "max_tilt": FOOT_COSTS_MAX_TILT,
+        },
+    )
 
     #---------------------------- Events ----------------------------
     del cfg.events["push_robot"]
