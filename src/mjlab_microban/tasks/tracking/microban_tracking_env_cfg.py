@@ -50,18 +50,13 @@ def make_microban_tracking_env_cfg(
     cfg.sim.nconmax = None
     cfg.sim.njmax = None
 
-    # Larger physics timestep (0.005 -> 0.01) with half the decimation, so the
-    # policy still runs at 50 Hz with half the physics steps.
-    cfg.sim.mujoco.timestep = 0.01
-    cfg.decimation = 2
+    # 5 ms physics timestep with a decimation of 4, so the policy runs at 50 Hz.
+    cfg.sim.mujoco.timestep = 0.005
+    cfg.decimation = 4
 
-    # Actuator delays are counted in physics steps: 2-3 steps of 10 ms keep the
-    # latency close to the 3-6 steps of 5 ms used by the velocity task.
-    robot_cfg = deepcopy(MICROBAN_ROBOT_CFG)
-    for actuator in robot_cfg.articulation.actuators:
-        actuator.delay_min_lag = 2
-        actuator.delay_max_lag = 3
-    cfg.scene.entities = {"robot": robot_cfg}
+    # Actuator delays are counted in physics steps; the robot defaults (3-6
+    # steps of 5 ms) match the velocity task.
+    cfg.scene.entities = {"robot": deepcopy(MICROBAN_ROBOT_CFG)}
 
     #---------------------------- Sensors ---------------------------
     self_collision_sensor_cfg = ContactSensorCfg(
@@ -114,6 +109,15 @@ def make_microban_tracking_env_cfg(
     cfg.rewards["motion_global_root_ori"].params["std"] = 0.7
     cfg.rewards["motion_body_pos"].params["std"] = 0.18
     cfg.rewards["motion_body_ori"].params["std"] = 0.7
+
+    # Near the reference the reward curvature scales with weight / std^2, so
+    # scale the weights up by more than (std / previous std)^2 (~5x for
+    # positions, ~3x for orientations) to track more tightly than with the
+    # previous 0.08/0.4 stds while keeping the wide basin.
+    cfg.rewards["motion_global_root_pos"].weight = 3.0
+    cfg.rewards["motion_global_root_ori"].weight = 2.0
+    cfg.rewards["motion_body_pos"].weight = 6.0
+    cfg.rewards["motion_body_ori"].weight = 4.0
     cfg.rewards["motion_body_pos"].params["body_names"] = END_EFFECTOR_BODY_NAMES
     cfg.rewards["motion_body_lin_vel"].params["std"] = 0.3
     cfg.rewards["motion_body_lin_vel"].params["body_names"] = END_EFFECTOR_BODY_NAMES
@@ -128,7 +132,7 @@ def make_microban_tracking_env_cfg(
     cfg.rewards["motion_body_ang_vel"].params["body_names"] = ("head",)
 
     # Reduce action-rate penalty so it does not crush exploration early on.
-    cfg.rewards["action_rate_l2"].weight = -1e-2
+    cfg.rewards["action_rate_l2"].weight = -1e-3
 
     cfg.rewards["self_collisions"].params["force_threshold"] = 1.0
 
