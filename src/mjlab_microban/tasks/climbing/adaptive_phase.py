@@ -154,6 +154,8 @@ class _AdaptivePhaseMotionCommand(_TimeScaledMotionCommand):
             self._phase_action = cast(PhaseRateAction, self._env.action_manager.get_term(self.phase_cfg.action_name))
         self.phase_rate_ref = self.compute_phase_rate_ref()
         self.phase_rate = self.phase_rate_ref + self.phase_cfg.sigma * self._phase_action.delta
+        if self.phase_cfg.min_rate is not None:
+            self.phase_rate = self.phase_rate.clamp(min=self.phase_cfg.min_rate)
         # Not before the first frame of the motion (the paper's phase lives in [0, 1]); the end of the motion is
         # handled by the base class (resampling).
         speed = self.nominal_speed * self.phase_rate
@@ -231,6 +233,10 @@ class PhaseRateActionCfg(ActionTermCfg):
     """This term's name in the env's actions (the command reads dv from it)."""
     sigma: float = 0.01
     """sigma_1: scale of dv on the phase rate."""
+    delta_clip: float | None = None
+    """dv is clipped to [-delta_clip, delta_clip] (None: unclipped, as in the paper)."""
+    min_rate: float | None = None
+    """Lower bound on the phase rate v (None: unbounded). Set in play so the reference never stalls."""
     k: float = 10.0
     """Each v_ref factor is min(k ** (1 - e / tol^2), 1)."""
     rate_terms: tuple[str, ...] = ("balls", "trunk_pos", "trunk_ori")
@@ -267,8 +273,10 @@ class PhaseRateAction(ActionTerm):
 
     @property
     def delta(self) -> torch.Tensor:
-        """dv, [B]."""
-        return self._raw[:, 0]
+        """dv, [B], clipped to +-delta_clip."""
+        dv = self._raw[:, 0]
+        clip = self.cfg.delta_clip
+        return dv if clip is None else dv.clamp(-clip, clip)
 
     def process_actions(self, actions: torch.Tensor) -> None:
         self._raw[:] = actions

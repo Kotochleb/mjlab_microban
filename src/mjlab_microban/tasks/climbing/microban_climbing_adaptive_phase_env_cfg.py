@@ -9,7 +9,7 @@ adaptive_phase.py): any climbing env config (single board, Conv1d, Conv1d-Histor
 climb's phase advances at a rate set by how well the robot tracks it, plus a policy residual on that rate.
 
 On top of the base env:
-  - actions: one more, the phase rate residual dv (last in the action vector), v = v_ref + 0.01 * dv;
+  - actions: one more, the phase rate residual dv (last in the action vector), v = v_ref + 0.1 * clip(dv, +-2);
   - observations: the phase phi (normalised over the climb) and v_ref, for actor and critic; the critic also gets
     the phase lag behind the nominal phase (the progress reward depends on it);
   - rewards: the task progress reward v_ref * exp(-(lag / 2 s)^2);
@@ -31,8 +31,12 @@ from mjlab_microban.robot.microban_climb_constants import BALL_SITE_NAMES
 from mjlab_microban.tasks.climbing import adaptive_phase
 from mjlab_microban.tasks.climbing.microban_climbing_env_cfg import make_microban_climbing_env_cfg
 
-# sigma_1 and k of the paper.
-PHASE_RATE_SCALE = 0.01
+# sigma_1 and k of the paper. sigma_1 is 10x the paper's 0.01: at 0.01, noise on dv barely changes the return, so PPO
+# gets no signal on dv's std (which the entropy bonus then inflates) and the policy can hardly move a stalled phase.
+# Stalling still takes dv = -v_ref / sigma_1 = -10, beyond the clip: the policy can slow the phase to 0.8x, not stop it.
+PHASE_RATE_SCALE = 0.1
+# dv is clipped to +-PHASE_DELTA_CLIP: the phase rate moves by at most +-0.2 around v_ref.
+PHASE_DELTA_CLIP = 2.0
 PHASE_RATE_K = 10.0
 
 # Tracking tolerances of the reference phase rate's factors (each is 1 within its tolerance, 0.1 at 1.41 x it, 0.01
@@ -50,6 +54,7 @@ CURRICULUM_STEP = 0.25
 CURRICULUM_UP = 0.95
 CURRICULUM_DOWN = 0.75
 CURRICULUM_UPDATE_STEPS = 24  # one PPO iteration (rl_cfg num_steps_per_env)
+PLAY_MIN_PHASE_RATE = 0.1  # in play, the reference advances at least at 10 % of its nominal speed
 
 
 def to_adaptive_phase(cfg: ManagerBasedRlEnvCfg, play: bool = False) -> ManagerBasedRlEnvCfg:
@@ -58,10 +63,12 @@ def to_adaptive_phase(cfg: ManagerBasedRlEnvCfg, play: bool = False) -> ManagerB
         command_name="motion",
         action_name="phase_rate",
         sigma=PHASE_RATE_SCALE,
+        delta_clip=PHASE_DELTA_CLIP,
         k=PHASE_RATE_K,
         rate_terms=tuple(PHASE_RATE_TOLERANCES),
         tolerances=dict(PHASE_RATE_TOLERANCES),
         ball_site_names=BALL_SITE_NAMES,
+        min_rate=PLAY_MIN_PHASE_RATE if play else None,
     )
 
     cfg.observations["actor"].terms["phase"] = ObservationTermCfg(

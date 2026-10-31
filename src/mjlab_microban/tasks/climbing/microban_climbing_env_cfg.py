@@ -433,12 +433,12 @@ def make_microban_climbing_env_cfg(
                 "full_steps": 1000 * 24,
             },
         )
-        # Ball sphere (collision geom) positions: +-1 mm in x, y and z, per env and ball, same schedule.
+        # Ball sphere (collision geom) positions: +-0.5 mm in x, y and z, per env and ball, same schedule.
         cfg.curriculum["ball_pos_dr"] = CurriculumTermCfg(
             func=mdp.geom_pos_dr_curriculum,
             params={
                 "asset_cfg": SceneEntityCfg("robot", geom_names=BALL_GEOM_NAMES),
-                "max_offset": 0.001,
+                "max_offset": 0.0005,
                 "start_frac": 0.01,
                 "hold_steps": 500 * 24,
                 "full_steps": 1000 * 24,

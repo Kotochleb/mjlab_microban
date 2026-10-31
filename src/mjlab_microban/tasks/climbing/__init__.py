@@ -84,11 +84,17 @@ for _suffix, _base_fn, _rl_cfg in (
     ("-Conv1d-History", make_microban_climbing_conv1d_history_env_cfg, MicrobanClimbingConv1dHistoryRlCfg),
 ):
     _ap_fn = adaptive_phase_base_fn(_base_fn)
+    # No entropy bonus, as in the paper: nothing else would hold back the std of dv, which matters little to the return.
+    _ap_rl_cfg = replace(
+        _rl_cfg,
+        experiment_name=f"{_rl_cfg.experiment_name}_adaptive_phase",
+        algorithm=replace(_rl_cfg.algorithm, entropy_coef=0.0),
+    )
     register_mjlab_task(
         task_id=f"Mjlab-Climbing-Microban-Adaptive-Phase{_suffix}",
         env_cfg=_ap_fn(),
         play_env_cfg=_ap_fn(play=True),
-        rl_cfg=replace(_rl_cfg, experiment_name=f"{_rl_cfg.experiment_name}_adaptive_phase"),
+        rl_cfg=_ap_rl_cfg,
         runner_cls=MotionTrackingOnPolicyRunner,
     )
     try:
@@ -101,6 +107,6 @@ for _suffix, _base_fn, _rl_cfg in (
         task_id=f"Mjlab-Climbing-Microban-Adaptive-Phase-Multi-Board{_suffix}",
         env_cfg=_env_cfg,
         play_env_cfg=_play_env_cfg,
-        rl_cfg=replace(_rl_cfg, experiment_name=f"{_rl_cfg.experiment_name}_adaptive_phase_multi_board"),
+        rl_cfg=replace(_ap_rl_cfg, experiment_name=f"{_ap_rl_cfg.experiment_name}_multi_board"),
         runner_cls=MotionTrackingOnPolicyRunner,
     )
