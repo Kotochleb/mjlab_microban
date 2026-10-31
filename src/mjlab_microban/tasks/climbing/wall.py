@@ -77,7 +77,13 @@ FIVE_BOX_WORLD_BOXES = ("lip",)
 DEFAULT_WALL = "2:0"  # without a motion on the command line: level 2, seed 0, the competition wall N2
 
 # The env's motion on the train / play command line (its used holds collide as 5-box cups, see make_wall_cfg).
-MOTION_FILE_FLAGS = ("--env.commands.motion.motion-file", "--env.commands.motion.motion_file")
+# train takes --env.commands.motion.motion-file, play takes --motion-file.
+MOTION_FILE_FLAGS = (
+    "--env.commands.motion.motion-file",
+    "--env.commands.motion.motion_file",
+    "--motion-file",
+    "--motion_file",
+)
 CONTACT_PLAN_SCHEMA = "contact_plan/1"  # rock-climbing-workshop: rcr.io
 
 

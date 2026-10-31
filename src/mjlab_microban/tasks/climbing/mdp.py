@@ -240,6 +240,13 @@ def _motion_last_frame(command: MotionCommand) -> torch.Tensor:
     return torch.full_like(command.time_steps, command.motion.time_step_total - 1)
 
 
+def _motion_first_frame(command: MotionCommand) -> torch.Tensor:
+    """First frame of each env's motion, shape [B]: its board's segment start for a MultiBoardMotionCommand."""
+    if hasattr(command, "segment_start") and hasattr(command, "board_ids"):
+        return command.segment_start[command.board_ids]
+    return torch.zeros_like(command.time_steps)
+
+
 def motion_frames_ahead(command: MotionCommand, offsets: torch.Tensor) -> torch.Tensor:
     """Motion frames ``offsets`` env steps ahead of the current one, shape [B, K], clamped to the last frame.
 
@@ -254,6 +261,8 @@ def motion_frames_ahead(command: MotionCommand, offsets: torch.Tensor) -> torch.
         frac = command.phase - t.float()
         frac = torch.where((frac >= -_PHASE_EPS) & (frac < 1.0), frac, torch.zeros_like(frac))  # 0 if just resampled
         idx = t[:, None] + torch.floor(frac[:, None] + speed[:, None] * offsets + _PHASE_EPS).long()
+    # The adaptive phase (adaptive_phase.py) can run backwards: not before the first frame either.
+    idx = torch.maximum(idx, _motion_first_frame(command)[:, None])
     return torch.minimum(idx, _motion_last_frame(command)[:, None])
 
 
@@ -319,7 +328,12 @@ class motion_speed_curriculum:
         command = cast(MotionCommand, env.command_manager.get_term(cfg.params["command_name"]))
         self._command = enable_motion_speed(command)
         lo, hi = cfg.params["start_range"]
-        self._command.speed.uniform_(lo, hi)
+        self._speed().uniform_(lo, hi)
+
+    def _speed(self) -> torch.Tensor:
+        """The speed this curriculum draws: the nominal one under the adaptive phase (adaptive_phase.py), whose
+        ``speed`` is the actual phase rate."""
+        return getattr(self._command, "nominal_speed", self._command.speed)
 
     def __call__(
         self,
@@ -335,7 +349,7 @@ class motion_speed_curriculum:
         alpha = _dr_ramp(env.common_step_counter, hold_steps, full_steps)
         lo = start_range[0] + alpha * (full_range[0] - start_range[0])
         hi = start_range[1] + alpha * (full_range[1] - start_range[1])
-        speed = self._command.speed
+        speed = self._speed()
         if isinstance(env_ids, slice):
             speed[env_ids] = torch.empty_like(speed[env_ids]).uniform_(lo, hi)
         elif env_ids.numel() > 0:
@@ -797,8 +811,10 @@ class motion_contact_schedule:
         q_inv = quat_inv(command.robot_anchor_quat_w)[:, None].expand(-1, next_pos_w.shape[1], -1)
         next_pos_b = quat_apply(q_inv, next_pos_w - command.robot_anchor_pos_w[:, None]).reshape(B, -1)
         frames_to = (self.next_frame[t] - t[:, None]).clamp(min=0).float()
-        speed = getattr(command, "speed", None)
-        if speed is not None:  # motion_speed_curriculum: speed motion frames per env step
+        # motion_speed_curriculum: speed motion frames per env step (the nominal one under the adaptive phase, whose
+        # actual rate can be 0).
+        speed = getattr(command, "nominal_speed", getattr(command, "speed", None))
+        if speed is not None:
             frames_to = frames_to / speed[:, None]
         time_to = torch.clamp(frames_to * self.step_dt, max=max_time)
         return torch.cat([now, future, next_pos_b, time_to], dim=-1)
