@@ -465,7 +465,7 @@ def make_microban_climbing_env_cfg(
         # Penalty per ball / capsule touching the bottom of a hold, from below (any other contact is allowed).
         "hold_bottom_contact": RewardTermCfg(
             func=mdp.hold_bottom_contact,
-            weight=-0.5,
+            weight=-1.5,
             params={
                 "sensor_name": grip_hold_contact_sensor_cfg.name,
                 "num_slots": GRIP_HOLD_CONTACT_SLOTS,
