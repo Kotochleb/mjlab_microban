@@ -25,18 +25,14 @@ Env frame (env origin): x towards the wall (the robot is at x < 0, facing +x), y
 a -90 deg yaw, then the offset that puts the hold sockets (the ball centres of a hooked robot, 26 mm out of
 the wall face) on the plane x = 0 and the middle of the 0.8 m wide wall on y = 0.
 
-climbing_sim is found as an installed package, or else in the hackathon checkout next to this repository
-(../simulator, or the environment variable CLIMBING_SIM_PATH): only its wall / routes modules are loaded
-then, which need nothing but numpy (the package's __init__ also imports its robot simulator).
+climbing_sim's wall / routes modules (and the assets they need) are copied into this project, in
+tasks/climbing/climbing_sim (see its __init__): the simulator checkout is not needed.
 """
 
 from __future__ import annotations
 
-import importlib
 import json
-import os
 import sys
-import types
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -76,7 +72,6 @@ COLLISION_HANDLES = 4
 # 5-box cup boxes in the WORLD group (besides HANDLES): the front of the cup.
 FIVE_BOX_WORLD_BOXES = ("lip",)
 
-DEFAULT_SIM_PATH = Path(__file__).resolve().parents[5] / "simulator"  # climbing_hackaton/simulator
 DEFAULT_WALL = "2:0"  # without a motion on the command line: level 2, seed 0, the competition wall N2
 
 # The env's motion on the train / play command line (its used holds collide as 5-box cups, see make_wall_cfg).
@@ -90,22 +85,10 @@ CONTACT_PLAN_SCHEMA = "contact_plan/1"  # rock-climbing-workshop: rcr.io
 
 
 def _climbing_sim():
-    """The climbing_sim modules used here: (wall, routes)."""
-    try:
-        return importlib.import_module("climbing_sim.wall"), importlib.import_module("climbing_sim.routes")
-    except ImportError:
-        pass
-    root = Path(os.environ.get("CLIMBING_SIM_PATH", DEFAULT_SIM_PATH)) / "climbing_sim"
-    if not (root / "routes.py").exists():
-        raise ImportError(
-            f"climbing_sim not found: install it, or set CLIMBING_SIM_PATH to the simulator checkout (tried {root})"
-        )
-    # The package without its __init__ (which imports the robot simulator, microban_sim).
-    sys.modules.pop("climbing_sim", None)
-    pkg = types.ModuleType("climbing_sim")
-    pkg.__path__ = [str(root)]
-    sys.modules["climbing_sim"] = pkg
-    return importlib.import_module("climbing_sim.wall"), importlib.import_module("climbing_sim.routes")
+    """The climbing_sim modules used here: (wall, routes), from the copy in tasks/climbing/climbing_sim."""
+    from mjlab_microban.tasks.climbing.climbing_sim import routes, wall
+
+    return wall, routes
 
 
 @dataclass(frozen=True)
