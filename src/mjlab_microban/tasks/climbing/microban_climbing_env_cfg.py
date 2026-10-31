@@ -26,6 +26,7 @@ from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.observation_manager import ObservationGroupCfg, ObservationTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
+from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import ContactMatch, ContactSensorCfg
 from mjlab.tasks.tracking import mdp as tracking_mdp
@@ -62,9 +63,11 @@ def make_microban_climbing_env_cfg(
 ) -> ManagerBasedRlEnvCfg:
     cfg = make_tracking_env_cfg()
 
-    # Microban's contacts outgrow the G1-sized caps, let mujoco_warp size them.
+    # Microban's contacts outgrow the G1-sized caps. Contacts are sized by mujoco_warp (128 per world
+    # from the initial pose, pooled across worlds); constraint rows are fixed per world, so cap them
+    # explicitly with headroom (random-action rollouts peak around 400 rows in a world).
     cfg.sim.nconmax = None
-    cfg.sim.njmax = None
+    cfg.sim.njmax = 1024
 
     # 5 ms physics timestep with a decimation of 4, so the policy runs at 50 Hz.
     cfg.sim.mujoco.timestep = 0.005
@@ -129,6 +132,16 @@ def make_microban_climbing_env_cfg(
     #---------------------------- Observations ----------------------
     cfg.observations["actor"].terms["motion_anchor_pos_b"].noise = Unoise(n_min=-0.06, n_max=0.06)
     cfg.observations["actor"].terms["base_lin_vel"].noise = Unoise(n_min=-0.15, n_max=0.15)
+
+    # Privileged critic observations: world placement (position relative to the env origin, and
+    # orientation) of the robot's trunk and of the reference trunk. The wall is fixed in the env frame,
+    # so this tells the critic where the robot is relative to the holds.
+    cfg.observations["critic"].terms["base_pose_w"] = ObservationTermCfg(
+        func=mdp.robot_anchor_pose_w, params={"command_name": "motion"}
+    )
+    cfg.observations["critic"].terms["motion_base_pose_w"] = ObservationTermCfg(
+        func=mdp.motion_anchor_pose_w, params={"command_name": "motion"}
+    )
 
     # Rolling window over the next FUTURE_WINDOW_STEPS frames of the planned climb (anchor pose, ball
     # positions and joint positions), for both the actor and the critic.
@@ -234,6 +247,9 @@ def make_microban_climbing_env_cfg(
     cfg.terminations["anchor_pos"].params["threshold"] = 0.07
     cfg.terminations["ee_body_pos"].params["threshold"] = 0.07
     cfg.terminations["ee_body_pos"].params["body_names"] = END_EFFECTOR_BODY_NAMES
+    # Stopgap: rare physics blow-ups (NaN state) under violent early-training actions; reset those envs
+    # before their observations are computed (their reward is already zeroed by the reward manager).
+    cfg.terminations["nan_detection"] = TerminationTermCfg(func=envs_mdp.nan_detection)
 
     #---------------------------- Viewer ----------------------------
     cfg.viewer.body_name = "trunk"

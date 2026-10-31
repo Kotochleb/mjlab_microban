@@ -281,3 +281,23 @@ class ResidualJointPositionAction(JointPositionAction):
         encoder_bias = self._entity.data.encoder_bias[:, self._target_ids]
         target = ref_joint_pos + self._processed_actions - encoder_bias
         self._entity.set_joint_position_target(target, joint_ids=self._target_ids)
+
+
+
+def _pose_w(pos_w: torch.Tensor, quat_w: torch.Tensor, env: ManagerBasedRlEnv) -> torch.Tensor:
+    """Position relative to the env origin (3) and orientation as the first two rotation matrix columns (6)."""
+    rot = matrix_from_quat(quat_w)[..., :2].reshape(pos_w.shape[0], 6)
+    return torch.cat([pos_w - env.scene.env_origins, rot], dim=-1)
+
+
+def robot_anchor_pose_w(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor:
+    """World placement of the robot's anchor (trunk): position relative to the env origin and orientation."""
+    command = cast(MotionCommand, env.command_manager.get_term(command_name))
+    return _pose_w(command.robot_anchor_pos_w, command.robot_anchor_quat_w, env)
+
+
+def motion_anchor_pose_w(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor:
+    """World placement of the motion's reference anchor (trunk): position relative to the env origin and
+    orientation."""
+    command = cast(MotionCommand, env.command_manager.get_term(command_name))
+    return _pose_w(command.anchor_pos_w, command.anchor_quat_w, env)
