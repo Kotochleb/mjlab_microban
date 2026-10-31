@@ -290,6 +290,9 @@ def main() -> None:
     cmd_cfg = next(c for n, c in zip(env.observation_manager.active_terms["actor"],
                                      env.observation_manager._group_obs_term_cfgs["actor"]) if n == "command")
     num_steps, stride = int(cmd_cfg.params.get("num_steps", 20)), int(cmd_cfg.params.get("stride", 1))
+    future_offsets = cmd_cfg.params.get("offsets")
+    future_offsets = (np.arange(1, num_steps + 1) * stride if future_offsets is None
+                      else np.asarray(future_offsets, dtype=np.int64))
     phase_cfg = env.action_manager.get_term("phase_rate").cfg if has_phase else None
     bundle = {
         "format": move_mod.BUNDLE_FORMAT,
@@ -303,7 +306,7 @@ def main() -> None:
         "obs_terms": np.array([t for t, _, _ in layout]),
         "obs_dims": np.array([d for _, d, _ in layout]),
         "obs_history": np.array([h for _, _, h in layout]),
-        "future_offsets": np.arange(1, num_steps + 1) * stride,
+        "future_offsets": future_offsets,
         "ref_joint_pos": motion.joint_pos.cpu().numpy(),
         "ref_trunk_pos": motion.body_pos_w[:, anchor].cpu().numpy(),
         "ref_trunk_quat": motion.body_quat_w[:, anchor].cpu().numpy(),

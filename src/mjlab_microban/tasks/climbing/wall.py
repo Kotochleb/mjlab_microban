@@ -2,8 +2,8 @@
 
 The holds are made by climbing_sim itself, the same way as rock-climbing-workshop/scripts/plan_sim_wall.py
 does to plan the reference climbs: ``climbing_sim.routes.generate_wall(level, seed)``, or a bundled wall /
-a wall JSON file (``climbing_sim.Wall.load``). The holds are at the simulator's sockets with its visual mesh,
-but collide as boxes (hold_boxes.py): the holds the planner uses as a 5-box cup (the ball sits on the socket,
+a wall JSON file (``climbing_sim.Wall.load``; the walls of boards/walls load by name, see ``wall_file``).
+The holds are at the simulator's sockets with its visual mesh, but collide as boxes (hold_boxes.py): the holds the planner uses as a 5-box cup (the ball sits on the socket,
 as in the simulator), the others as a 1-box block (see ``make_wall_cfg``). The used holds are stored in the
 motion .npz as ``used_holds`` (planner hold ids r<row>_c<col>): plan_sim_wall.py --save-npz writes them, and
 scripts/workshop_to_npz.py carries them into the env motion.
@@ -56,23 +56,35 @@ HOLD_FRICTION = 0.5  # climbing_sim.scene.build_spec's default
 # Collision groups (contype / conaffinity bits). Two geoms collide if (contype1 & conaffinity2) or
 # (contype2 & conaffinity1); the wall geoms have contype 0, so their conaffinity alone picks the robot geoms:
 #   WORLD    every robot collision geom (contype bit 0, robot_climb.xml) <-> the floor, the board, the 1-box
-#            blocks and the lips (fronts) of the 5-box cups
+#            blocks and the fronts of the 5-box cups (the lip and the front post)
 #   SELF     robot <-> robot (robot_climb.xml: conaffinity 2), not used by the wall
 #   HANDLES  the four hand / foot balls and the two hand capsules (contype |= HANDLES, see the climbing env)
-#            <-> all five boxes of the 5-box cups
-# So the body boxes never reach the inside of a cup (ledge, back, sides), and the narrowphase only sees
-# the pairs that matter.
+#            <-> every box of the 5-box cups (hold_boxes.FIVE_BOX and FIVE_BOX_POSTS)
+#   FEET     the two foot sole boxes (contype |= FEET, see the climbing env) <-> the 5-box ledges
+# So the body boxes never reach the inside of a cup (ledge, back, sides, side posts), and the narrowphase only
+# sees the pairs that matter.
 #
-#                     board  1-box  5-box lip  5-box ledge/back/sides
-#   balls               x      x       x               x
-#   other robot geoms   x      x       x
+#                     board  1-box  5-box lip,   5-box   5-box back/sides,  |  in the "wall" subtree
+#                                   front post   ledge   side posts         |  (seen by the wall contact sensors)?
+#   balls, hand caps.   x      x       x          x          x              |  board, 1-box, lip, ledge, back,
+#   foot soles          x      x       x          x                         |  sides: yes
+#   other robot geoms   x      x       x                                    |  front post, side posts: no
 COLLISION_WORLD = 1
 COLLISION_SELF = 2
 COLLISION_HANDLES = 4
+COLLISION_FEET = 8
 # Body (child of "wall") carrying the 1-box blocks of the holds the motion does not use.
 ONE_BOX_BODY = "one_box_blocks"
-# 5-box cup boxes in the WORLD group (besides HANDLES): the front of the cup.
-FIVE_BOX_WORLD_BOXES = ("lip",)
+# Body (child of the worldbody, not of "wall") carrying the 5-box cups' posts (hold_boxes.FIVE_BOX_POSTS): they
+# collide, but no contact sensor on the "wall" subtree sees them, so no reward / observation depends on them.
+POSTS_BODY = "hold_posts"
+# 5-box cup boxes in the WORLD group (besides HANDLES): the front of the cup (the lip and its upright post).
+FIVE_BOX_WORLD_BOXES = ("lip", "front_post")
+# 5-box cup boxes in the FEET group (besides HANDLES): the floor of the cup.
+FIVE_BOX_FEET_BOXES = ("ledge",)
+
+# Wall JSON files of this project (climbing_sim form), loaded by name (their file stem), see wall_file.
+WALLS_DIR = Path(__file__).parent / "boards" / "walls"
 
 DEFAULT_WALL = "2:0"  # without a motion on the command line: level 2, seed 0, the competition wall N2
 
@@ -105,7 +117,7 @@ class WallSpec:
 
     level: int = 2
     seed: int = 0
-    name: str | None = None  # a bundled wall (N1, N2, N3) or a wall JSON file
+    name: str | None = None  # a bundled wall (N1, N2, N3), a wall of boards/walls, or a wall JSON file
 
     @classmethod
     def parse(cls, text: str) -> WallSpec:
@@ -157,12 +169,24 @@ def wall_spec_from_argv() -> WallSpec:
     return WallSpec.parse(DEFAULT_WALL)
 
 
+def wall_file(name: str) -> Path:
+    """The JSON file of a named wall: a bundled competition wall (N1-N3, climbing_sim/walls), a wall of
+    boards/walls (by its file stem, e.g. "l2_s3"), or a path to a wall JSON file (climbing_sim's form)."""
+    wall_mod, _ = _climbing_sim()
+    if not Path(name).suffix:
+        for folder in (wall_mod.WALLS_DIR, WALLS_DIR):
+            if (folder / f"{name}.json").exists():
+                return Path(folder / f"{name}.json")
+        raise FileNotFoundError(f"no wall {name!r} in {wall_mod.WALLS_DIR} or {WALLS_DIR}")
+    return Path(name)
+
+
 @lru_cache(maxsize=None)
 def sim_wall(spec: WallSpec):
     """The climbing_sim Wall, made as rock-climbing-workshop/scripts/plan_sim_wall.py makes it."""
     wall_mod, routes = _climbing_sim()
     if spec.name:
-        return wall_mod.Wall.load(spec.name)
+        return wall_mod.Wall.from_json(wall_file(spec.name))
     return routes.generate_wall(spec.level, spec.seed)
 
 
@@ -214,6 +238,47 @@ def contact_plan_hold_ids(plan_file: str | Path) -> list[str]:
     return sorted(ids)
 
 
+def contact_plan_file(motion_file: str | Path) -> Path:
+    """The contact plan of a planned motion: <motion>_plan.json next to it (scripts/make_multi_board_motions.py,
+    plan_board.py --save)."""
+    motion_file = Path(motion_file)
+    return motion_file.with_name(motion_file.stem + "_plan.json")
+
+
+def planned_contacts(plan_file: str | Path, num_frames: int, limbs: tuple[str, ...]) -> np.ndarray:
+    """The planner's contacts of every motion frame, [num_frames, len(limbs)] bool (limbs: the plan's names,
+    e.g. "left_hand").
+
+    The plan is a sequence of stances (each limb on a hold); the trajectory optimiser (rcr.kinematics.ik) gives
+    each move the same time, starting at frame 0 in the first stance, and the motion has the moves' frames (its
+    last frame, the landing of the last move, cut off by the conversion). A limb is in contact while it is on a
+    hold in the stance: all frames, except, during the move that changes its hold, from the frame after the move
+    starts to the one before it lands. The motion's last frame is the last stance (the climb's end pose, which
+    the clamped future windows keep showing). A limb on nothing (None) is not in contact.
+    """
+    data = json.loads(Path(plan_file).read_text())
+    if data.get("schema") != CONTACT_PLAN_SCHEMA:
+        raise ValueError(f"{plan_file}: expected schema {CONTACT_PLAN_SCHEMA!r}, found {data.get('schema')!r}")
+    stances = [s["contacts"] for s in data["stances"]]
+    moves = len(stances) - 1
+    if moves < 1 or num_frames % moves not in (0, 1):
+        raise ValueError(f"{plan_file}: {moves} moves do not split the motion's {num_frames} frames evenly")
+    move_frames = num_frames // moves
+    on = np.array([[s.get(limb) is not None for limb in limbs] for s in stances])  # [S, N]
+    contact = np.empty((num_frames, len(limbs)), dtype=bool)
+    contact[0] = on[0]
+    for m, (a, b) in enumerate(zip(stances, stances[1:])):
+        start = m * move_frames  # the move's frames: start + 1 .. start + move_frames (landing)
+        frames = slice(start + 1, min(start + move_frames + 1, num_frames))
+        moving = np.array([a.get(limb) != b.get(limb) for limb in limbs])
+        contact[frames] = on[m + 1] & ~moving
+        landing = start + move_frames
+        if landing < num_frames:
+            contact[landing] = on[m + 1]
+    contact[-1] = on[-1]
+    return contact
+
+
 def hold_indices(spec: WallSpec, ids) -> frozenset[int]:
     """Indices (wall.holds order) of the holds with these planner ids; an id not on the wall is an error."""
     index = {hold_id(h): k for k, h in enumerate(sim_wall(spec).holds)}
@@ -248,14 +313,15 @@ def motion_used_hold_ids(motion_file: str | Path) -> list[str]:
 
 def _add_hold_boxes(body, name: str, socket: np.ndarray, boxes, friction, rgba, conaffinity) -> None:
     """conaffinity: box name -> its collision groups (contype 0, see COLLISION_WORLD)."""
-    quat = SIM_TO_ENV_QUAT.tolist()
     for b in boxes:
+        quat = np.zeros(4)
+        mujoco.mju_mulQuat(quat, SIM_TO_ENV_QUAT, np.asarray(b.quat, float))  # the box's tilt, then sim -> env
         body.add_geom(
             name=f"{name}_{b.name}",
             type=mujoco.mjtGeom.mjGEOM_BOX,
             size=b.half_size.tolist(),
             pos=(socket + SIM_TO_ENV_ROT @ b.center).tolist(),
-            quat=quat,
+            quat=quat.tolist(),
             group=3,
             rgba=rgba,
             friction=friction,
@@ -266,15 +332,17 @@ def _add_hold_boxes(body, name: str, socket: np.ndarray, boxes, friction, rgba, 
 
 
 def _five_box_conaffinity(box_name: str) -> int:
-    return COLLISION_HANDLES | (COLLISION_WORLD if box_name in FIVE_BOX_WORLD_BOXES else 0)
+    return (COLLISION_HANDLES | (COLLISION_WORLD if box_name in FIVE_BOX_WORLD_BOXES else 0)
+            | (COLLISION_FEET if box_name in FIVE_BOX_FEET_BOXES else 0))
 
 
 def _one_box_conaffinity(box_name: str) -> int:
     return COLLISION_WORLD
 
 
-def _new_wall_spec() -> tuple[mujoco.MjSpec, mujoco.MjsBody, mujoco.MjsBody]:
-    """An empty wall spec: its materials and hold mesh, the body "wall" and its child ONE_BOX_BODY."""
+def _new_wall_spec() -> tuple[mujoco.MjSpec, mujoco.MjsBody, mujoco.MjsBody, mujoco.MjsBody]:
+    """An empty wall spec: its materials and hold mesh, the body "wall", its child ONE_BOX_BODY, and POSTS_BODY
+    (a sibling of "wall", so outside its subtree; mjlab's mocap wrapper moves the whole worldbody, so both)."""
     wall_mod, _ = _climbing_sim()
     assets = Path(wall_mod.__file__).parent / "assets" / "hold"
     mj = mujoco.MjSpec()
@@ -285,11 +353,12 @@ def _new_wall_spec() -> tuple[mujoco.MjSpec, mujoco.MjsBody, mujoco.MjsBody]:
     # The 1-box blocks are on a child body of the wall (fixed to it, no joint), so that a contact sensor can single
     # them out (ONE_BOX_BODY: the climbing env penalises the balls touching them).
     blocks_body = body.add_body(name=ONE_BOX_BODY)
-    return mj, body, blocks_body
+    posts_body = mj.worldbody.add_body(name=POSTS_BODY)
+    return mj, body, blocks_body, posts_body
 
 
-def _add_board(body, blocks_body, spec: WallSpec, used: frozenset[int] | None, offset=(0.0, 0.0, 0.0),
-               prefix: str = "") -> None:
+def _add_board(body, blocks_body, posts_body, spec: WallSpec, used: frozenset[int] | None,
+               offset=(0.0, 0.0, 0.0), prefix: str = "") -> None:
     """The board and the holds of ``spec`` (see get_spec), translated by ``offset`` (env frame), their geom / site
     names prefixed by ``prefix``."""
     wall_mod, _ = _climbing_sim()
@@ -331,6 +400,8 @@ def _add_board(body, blocks_body, spec: WallSpec, used: frozenset[int] | None, o
         if used is None or k in used:
             _add_hold_boxes(body, name, socket, hold_boxes.FIVE_BOX, friction, rgba=[0.25, 0.55, 0.95, 1],
                             conaffinity=_five_box_conaffinity)
+            _add_hold_boxes(posts_body, name, socket, hold_boxes.FIVE_BOX_POSTS, friction, rgba=[0.25, 0.55, 0.95, 1],
+                            conaffinity=_five_box_conaffinity)
         else:
             _add_hold_boxes(blocks_body, name, socket, hold_boxes.ONE_BOX, friction, rgba=[0.7, 0.3, 0.85, 1],
                             conaffinity=_one_box_conaffinity)
@@ -343,17 +414,17 @@ def get_spec(spec: WallSpec, used: frozenset[int] | None = None) -> mujoco.MjSpe
     The holds keep climbing_sim's visual mesh, but collide as boxes (hold_boxes.py): the holds in ``used``
     (those the motion puts a ball on, see ``used_holds``) as the 5-box cup, the others as the 1-box block.
     used=None: every hold is a 5-box cup. Collision groups: see COLLISION_WORLD."""
-    mj, body, blocks_body = _new_wall_spec()
-    _add_board(body, blocks_body, spec, used)
+    mj, body, blocks_body, posts_body = _new_wall_spec()
+    _add_board(body, blocks_body, posts_body, spec, used)
     return mj
 
 
 def get_multi_board_spec(boards, offsets) -> mujoco.MjSpec:
     """Several walls side by side in one body "wall" (one ONE_BOX_BODY for all their 1-box blocks): board i is
     ``boards[i] = (WallSpec, used holds)``, translated by ``offsets[i]`` (env frame), its names prefixed "b<i>_"."""
-    mj, body, blocks_body = _new_wall_spec()
+    mj, body, blocks_body, posts_body = _new_wall_spec()
     for i, ((spec, used), offset) in enumerate(zip(boards, offsets, strict=True)):
-        _add_board(body, blocks_body, spec, used, offset, prefix=f"b{i}_")
+        _add_board(body, blocks_body, posts_body, spec, used, offset, prefix=f"b{i}_")
     return mj
 
 

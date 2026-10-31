@@ -1,0 +1,94 @@
+{
+  "schema": "contact_plan/1",
+  "wall_id": "l2_s48",
+  "stances": [
+    {
+      "contacts": {
+        "right_hand": "r23_c29",
+        "left_hand": "r23_c18",
+        "right_foot": "r2_c26",
+        "left_foot": "r2_c21"
+      }
+    },
+    {
+      "contacts": {
+        "right_hand": "r23_c29",
+        "left_hand": "r23_c18",
+        "right_foot": "r2_c26",
+        "left_foot": "r5_c16"
+      }
+    },
+    {
+      "contacts": {
+        "right_hand": "r23_c29",
+        "left_hand": "r26_c16",
+        "right_foot": "r2_c26",
+        "left_foot": "r5_c16"
+      }
+    },
+    {
+      "contacts": {
+        "right_hand": "r23_c29",
+        "left_hand": "r26_c16",
+        "right_foot": "r5_c24",
+        "left_foot": "r5_c16"
+      }
+    },
+    {
+      "contacts": {
+        "right_hand": "r23_c29",
+        "left_hand": "r26_c16",
+        "right_foot": "r9_c26",
+        "left_foot": "r5_c16"
+      }
+    },
+    {
+      "contacts": {
+        "right_hand": "r23_c29",
+        "left_hand": "r26_c16",
+        "right_foot": "r9_c26",
+        "left_foot": "r9_c18"
+      }
+    },
+    {
+      "contacts": {
+        "right_hand": "r26_c31",
+        "left_hand": "r26_c16",
+        "right_foot": "r9_c26",
+        "left_foot": "r9_c18"
+      }
+    },
+    {
+      "contacts": {
+        "right_hand": "r26_c31",
+        "left_hand": "r30_c18",
+        "right_foot": "r9_c26",
+        "left_foot": "r9_c18"
+      }
+    },
+    {
+      "contacts": {
+        "right_hand": "r30_c29",
+        "left_hand": "r30_c18",
+        "right_foot": "r9_c26",
+        "left_foot": "r9_c18"
+      }
+    },
+    {
+      "contacts": {
+        "right_hand": "r30_c29",
+        "left_hand": "r30_c18",
+        "right_foot": "r9_c29",
+        "left_foot": "r9_c18"
+      }
+    },
+    {
+      "contacts": {
+        "right_hand": "r33_c31",
+        "left_hand": "r30_c18",
+        "right_foot": "r9_c29",
+        "left_foot": "r9_c18"
+      }
+    }
+  ]
+}

@@ -16,11 +16,11 @@ from mjlab.envs.mdp.actions import JointPositionAction, JointPositionActionCfg
 from mjlab.managers.event_manager import requires_model_fields
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import ContactSensor, TerrainHeightSensor
-from mjlab.tasks.tracking.mdp import MotionCommand
+from mjlab.tasks.tracking.mdp import MotionCommand, MotionCommandCfg
 from mjlab.utils.lab_api.math import matrix_from_quat, quat_apply, quat_error_magnitude, quat_inv, quat_mul
 
 from mjlab_microban.tasks.climbing import hold_boxes
-from mjlab_microban.tasks.climbing.wall import SIM_TO_ENV_ROT
+from mjlab_microban.tasks.climbing.wall import SIM_TO_ENV_ROT, contact_plan_file, planned_contacts
 
 if TYPE_CHECKING:
     from mjlab.envs import ManagerBasedRlEnv
@@ -242,6 +242,53 @@ def _motion_last_frame(command: MotionCommand) -> torch.Tensor:
         board = command.board_ids
         return command.segment_start[board] + command.segment_length[board] - 1
     return torch.full_like(command.time_steps, command.motion.time_step_total - 1)
+
+
+def _motion_climb_end(command: MotionCommand) -> torch.Tensor:
+    """Last frame of each env's climb, shape [B]: its last frame before the hold of the final pose (the motion
+    command's ``end_hold_frames``, see hold_final_frame)."""
+    return _motion_last_frame(command) - getattr(command, "end_hold_frames", 0)
+
+
+def hold_final_frame(motion, frames: int) -> None:
+    """Append ``frames`` copies of a motion's last frame (MotionLoader, in place), at rest (zero velocities):
+    the reference keeps the climb's final configuration for that long."""
+    if frames <= 0:
+        return
+    for key in ("joint_pos", "body_pos_w", "body_quat_w", "joint_vel", "body_lin_vel_w", "body_ang_vel_w"):
+        x = getattr(motion, key)
+        last = x[-1:] if key in ("joint_pos", "body_pos_w", "body_quat_w") else torch.zeros_like(x[-1:])
+        setattr(motion, key, torch.cat([x, last.expand(frames, *x.shape[1:])]).contiguous())
+    motion.time_step_total = motion.joint_pos.shape[0]
+
+
+class HoldEndMotionCommand(MotionCommand):
+    """MotionCommand whose motion ends with ``end_hold_s`` [s] of its final configuration at rest."""
+
+    cfg: HoldEndMotionCommandCfg
+
+    def __init__(self, cfg: HoldEndMotionCommandCfg, env: ManagerBasedRlEnv):
+        super().__init__(cfg, env)
+        self.end_hold_frames = round(cfg.end_hold_s / env.step_dt)
+        hold_final_frame(self.motion, self.end_hold_frames)
+        # The adaptive sampling's bins, over the longer motion (as MotionCommand.__init__).
+        self.bin_count = int(self.motion.time_step_total // (1 / env.step_dt)) + 1
+        self.bin_failed_count = torch.zeros(self.bin_count, dtype=torch.float, device=self.device)
+        self._current_bin_failed = torch.zeros(self.bin_count, dtype=torch.float, device=self.device)
+
+
+@dataclass(kw_only=True)
+class HoldEndMotionCommandCfg(MotionCommandCfg):
+    end_hold_s: float = 0.0  # [s] of the motion's final configuration, at rest, after its end
+
+    def build(self, env: ManagerBasedRlEnv) -> HoldEndMotionCommand:
+        return HoldEndMotionCommand(self, env)
+
+
+def motion_ended(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor:
+    """True once the env's reference is on the last frame of its motion (the end of its final pose's hold)."""
+    command = cast(MotionCommand, env.command_manager.get_term(command_name))
+    return command.time_steps >= _motion_last_frame(command)
 
 
 def _motion_first_frame(command: MotionCommand) -> torch.Tensor:
@@ -681,6 +728,49 @@ class geom_pos_dr_curriculum:
         return {"progress": alpha, "max_offset_mm": offset * 1e3}
 
 
+class sphere_radius_curriculum:
+    """Curriculum on the radius of some sphere geoms (the balls): undersized at the start, then grown to their
+    nominal size.
+
+    The radius is ``default - undersize`` [m] up to ``hold_steps`` env steps, then grows linearly to the default
+    (the MJCF's) at ``full_steps`` (_dr_ramp). The same for every env. The broadphase bounds (geom_rbound,
+    geom_aabb) follow the radius; the sites the rewards / observations use do not move.
+    """
+
+    _FIELDS = ("geom_size", "geom_rbound", "geom_aabb")
+
+    def __init__(self, cfg, env: ManagerBasedRlEnv):
+        asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
+        asset_cfg.resolve(env.scene)
+        asset: Entity = env.scene[asset_cfg.name]
+        self._geom_ids = asset.indexing.geom_ids[asset_cfg.geom_ids]
+        missing = tuple(f for f in self._FIELDS if f not in env.sim.expanded_fields)
+        if missing:
+            env.sim.expand_model_fields(missing)
+        self._default = env.sim.get_default_field("geom_size")[self._geom_ids, 0].clone()  # [G]
+        undersize = cfg.params["undersize"]
+        if undersize >= float(self._default.min()):
+            raise ValueError(f"undersize {undersize} m is not below the smallest radius {self._default.min()} m")
+
+    def __call__(
+        self,
+        env: ManagerBasedRlEnv,
+        env_ids: torch.Tensor | slice,
+        asset_cfg: SceneEntityCfg,
+        undersize: float,
+        hold_steps: int,
+        full_steps: int,
+    ) -> dict[str, float]:
+        del env_ids, asset_cfg
+        alpha = _dr_ramp(env.common_step_counter, hold_steps, full_steps)
+        radius = self._default - (1.0 - alpha) * undersize  # [G]
+        model = env.sim.model
+        model.geom_size[:, self._geom_ids, 0] = radius
+        model.geom_rbound[:, self._geom_ids] = radius
+        model.geom_aabb[:, self._geom_ids, 1] = radius[:, None]
+        return {"progress": alpha, "undersize_mm": (1.0 - alpha) * undersize * 1e3}
+
+
 @requires_model_fields("geom_size", "geom_pos", "geom_rbound", "geom_aabb")
 def shorten_box_geom(
     env: ManagerBasedRlEnv,
@@ -689,9 +779,11 @@ def shorten_box_geom(
     max_shortening: float,
     axis: int = 1,
     side: float = 1.0,
+    power: float = 1.0,
 ) -> None:
-    """Shorten box geoms by s ~ U(0, ``max_shortening``) [m] (per env and geom) along their local ``axis``, cutting
-    the ``side`` (+1 / -1) end: the opposite end stays in place, so the center moves by s / 2 towards it."""
+    """Shorten box geoms by s = ``max_shortening`` * u ** ``power``, u ~ U(0, 1) [m] (per env and geom) along their
+    local ``axis``, cutting the ``side`` (+1 / -1) end: the opposite end stays in place, so the center moves by
+    s / 2 towards it. ``power`` = 1 is uniform; ``power`` > 1 biases s towards 0 (mean max / (power + 1))."""
     asset: Entity = env.scene[asset_cfg.name]
     geom_ids = asset.indexing.geom_ids[asset_cfg.geom_ids]
     if env_ids is None:
@@ -704,7 +796,7 @@ def shorten_box_geom(
     unit[:, axis] = side
     cut_dir = quat_apply(def_quat, unit)  # [G, 3]: the cut end's direction, in the body frame
 
-    s = torch.rand(len(env_ids), len(geom_ids), device=env.device) * max_shortening  # [E, G]
+    s = torch.rand(len(env_ids), len(geom_ids), device=env.device).pow(power) * max_shortening  # [E, G]
     size = def_size.expand(len(env_ids), -1, -1).clone()
     size[..., axis] -= 0.5 * s
     pos = def_pos - 0.5 * s[..., None] * cut_dir
@@ -797,23 +889,52 @@ class ball_contacts:
 class motion_contact_schedule:
     """Where and when the reference expects the balls to be on holds.
 
-    The planned motion has no contact labels: a ball is expected in contact on the frames where its
-    reference position is within ``threshold`` of a hold socket (``hold_positions``, env frame: the centre
-    of a ball hooked in the hold, wall.hold_positions).
+    The expected contacts come from the planner's contact plan (``contact_source="plan"``, the default): the
+    motion's <motion>_plan.json, its stances timed as the trajectory optimiser does (wall.planned_contacts). With
+    ``contact_source="geometry"``, a ball is expected in contact on the frames where its reference position is
+    within ``threshold`` of a hold socket. Either way the hold of a contact is the socket nearest to the reference
+    ball (``hold_positions``, env frame: the centre of a ball hooked in the hold, wall.hold_positions).
     Per ball:
-      - expected contact now (1) and at the frames t+o for o in ``offsets`` (K),
+      - expected contact now (1) and at the frames t+o for o in ``offsets`` (K). Where the offsets are sparser than
+        every step, each one gives the fraction of the frames around it expected in contact, from halfway back to
+        the previous offset to halfway on to the next one (the skipped frames are split between their two
+        neighbours; the last offset's window reaches as far ahead as it does back), so a short contact between
+        two sampled frames is not lost,
       - position of the next expected contact (the hold, from frame t on), in the robot's trunk frame (3),
       - time until that contact [s], clipped to ``max_time`` (1); 0 while it is expected now.
-    After the last contact of the motion, the next contact is the last one.
+    After the last contact of the motion, the next contact is the last one. With ``contacts_only``, only the
+    expected contacts (now and at the offsets) are returned: they depend on the reference alone (no robot state),
+    so the actor can have them.
     """
 
     def __init__(self, cfg, env: ManagerBasedRlEnv):
         command = cast(MotionCommand, env.command_manager.get_term(cfg.params["command_name"]))
         ball_ref = self._ball_reference(cfg, env, command)
         holds = torch.tensor(cfg.params["hold_positions"], dtype=torch.float32, device=env.device)  # [H, 3], env frame
-        self.contact, self.next_frame, self.next_pos = self._schedule(ball_ref, holds, cfg.params.get("threshold", 0.003))
-        self.future = torch.tensor(cfg.params["offsets"], device=env.device)  # [K]
+        plan = self._planned_contacts(cfg, command.cfg.motion_file, ball_ref.shape[0], env.device)
+        self.contact, self.next_frame, self.next_pos = self._schedule(
+            ball_ref, holds, cfg.params.get("threshold", 0.003), plan
+        )
+        self._set_future(cfg.params["offsets"], env.device)
         self.step_dt = env.step_dt
+
+    def _set_future(self, offsets: tuple[int, ...], device) -> None:
+        """The frames averaged for each offset: ``self.window`` [M] offsets, ``self.window_weights`` [K, M]."""
+        offsets = [int(o) for o in offsets]
+        assert offsets == sorted(set(offsets)) and offsets[0] >= 1, "offsets must be increasing and >= 1"
+        window, rows = [], []
+        for k, o in enumerate(offsets):
+            gap_back = o - (offsets[k - 1] if k > 0 else 0)
+            gap_ahead = offsets[k + 1] - o if k + 1 < len(offsets) else gap_back
+            frames = range(o - (gap_back - 1) // 2, o + gap_ahead // 2 + 1)
+            rows.append((len(window), len(frames)))
+            window += frames
+        weights = torch.zeros(len(offsets), len(window), device=device)
+        for k, (start, n) in enumerate(rows):
+            weights[k, start : start + n] = 1.0 / n
+        self.future = torch.tensor(offsets, device=device)  # [K]
+        self.window = torch.tensor(window, device=device)  # [M]
+        self.window_weights = weights  # [K, M]
 
     @staticmethod
     def _ball_reference(cfg, env: ManagerBasedRlEnv, command: MotionCommand) -> torch.Tensor:
@@ -824,13 +945,33 @@ class motion_contact_schedule:
         return body_pos + quat_apply(body_quat, offs.expand_as(body_pos))
 
     @staticmethod
+    def _planned_contacts(cfg, motion_file: str, num_frames: int, device) -> torch.Tensor | None:
+        """[num_frames, N] contacts of the motion's contact plan (frames past the motion's: its last one), or None
+        with contact_source="geometry"."""
+        source = cfg.params.get("contact_source", "plan")
+        if source == "geometry":
+            return None
+        if source != "plan":
+            raise ValueError(f"contact_source must be 'plan' or 'geometry', got {source!r}")
+        plan_file = contact_plan_file(motion_file)
+        if not plan_file.exists():
+            raise FileNotFoundError(f"{plan_file}: no contact plan for {motion_file} (contact_source='plan')")
+        limbs = tuple(name.removesuffix("_ball") for name in cfg.params["site_names"])
+        motion_frames = int(np.load(motion_file)["joint_pos"].shape[0])
+        contact = torch.tensor(planned_contacts(plan_file, motion_frames, limbs), device=device)
+        pad = contact[-1:].expand(num_frames - motion_frames, -1)
+        return torch.cat([contact, pad])
+
+    @staticmethod
     def _schedule(
-        ball_ref: torch.Tensor, holds: torch.Tensor, threshold: float
+        ball_ref: torch.Tensor, holds: torch.Tensor, threshold: float, contact: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """For reference balls [T, N, 3] and hold sockets [H, 3]: expected contacts [T, N], next expected contact
-        frame [T, N] (in 0..T-1) and its hold position [T, N, 3]."""
+        """For reference balls [T, N, 3] and hold sockets [H, 3]: expected contacts [T, N] (``contact`` if given,
+        else the balls within ``threshold`` of a socket), next expected contact frame [T, N] (in 0..T-1) and its
+        hold position [T, N, 3]."""
         dist, hold_id = torch.cdist(ball_ref, holds[None].expand(ball_ref.shape[0], -1, -1)).min(dim=-1)  # [T, N]
-        contact = dist < threshold  # [T, N]
+        if contact is None:
+            contact = dist < threshold  # [T, N]
 
         # Next expected contact frame from each frame on (backward scan); after the last one, the last one.
         contact_np = contact.cpu().numpy()
@@ -857,13 +998,18 @@ class motion_contact_schedule:
         threshold: float = 0.003,
         max_time: float = 1.0,
         asset_name: str = "robot",
+        contacts_only: bool = False,
+        contact_source: str = "plan",
     ) -> torch.Tensor:
+        del contact_source  # used in __init__
         command = cast(MotionCommand, env.command_manager.get_term(command_name))
         t = command.time_steps
         B = t.shape[0]
-        idx = torch.clamp(motion_frames_ahead(command, self.future), max=self.contact.shape[0] - 1)  # [B, K]
+        idx = torch.clamp(motion_frames_ahead(command, self.window), max=self.contact.shape[0] - 1)  # [B, M]
         now = self.contact[t].float()  # [B, N]
-        future = self.contact[idx].float().reshape(B, -1)  # [B, K * N]
+        future = torch.einsum("km,bmn->bkn", self.window_weights, self.contact[idx].float()).reshape(B, -1)  # [B, K * N]
+        if contacts_only:
+            return torch.cat([now, future], dim=-1)
         next_pos_w = self.next_pos[t] + env.scene.env_origins[:, None]  # [B, N, 3]
         q_inv = quat_inv(command.robot_anchor_quat_w)[:, None].expand(-1, next_pos_w.shape[1], -1)
         next_pos_b = quat_apply(q_inv, next_pos_w - command.robot_anchor_pos_w[:, None]).reshape(B, -1)
@@ -1074,8 +1220,8 @@ class robot_stuck:
     The robot is stuck while its trunk (root) and its balls (``site_names``) all stay within ``distance`` [m] of
     where they were when it last moved: any of them moving farther restarts the clock from the new pose. So a
     climb where one limb moves at a time is not stuck, a robot hanging still on its holds is. The clock is
-    restarted on resets and held at 0 once the env's reference is on the last frame of its motion (nothing left
-    to climb).
+    restarted on resets and held at 0 once the env's reference is past the end of its climb (on the hold of its
+    final pose, or its last frame: nothing left to climb).
     """
 
     def __init__(self, cfg, env: ManagerBasedRlEnv):
@@ -1105,7 +1251,7 @@ class robot_stuck:
         moved = (points - self.anchor).norm(dim=-1).amax(dim=-1) > distance
         restart = moved | self.needs_anchor
         command = cast(MotionCommand, env.command_manager.get_term(command_name))
-        restart |= command.time_steps >= _motion_last_frame(command)
+        restart |= command.time_steps >= _motion_climb_end(command)
         self.anchor[restart] = points[restart]
         self.needs_anchor[:] = False
         self.stuck_time = torch.where(restart, torch.zeros_like(self.stuck_time), self.stuck_time + self.step_dt)
@@ -1127,17 +1273,22 @@ def motion_future_joint_pos(
     command_name: str,
     num_steps: int = 20,
     stride: int = 1,
+    offsets: tuple[int, ...] | None = None,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Future reference joint configurations: frames t+stride, ..., t+num_steps*stride of the motion.
+    """Future reference joint configurations: frames t+stride, ..., t+num_steps*stride of the motion, or, with
+    ``offsets`` given (which then override num_steps and stride), frames t+offsets.
 
     Joint positions are relative to the default joint positions (as the joint_pos observation), and
-    frames past the end of the motion are clamped to its last frame. Shape [B, num_steps * num_joints].
+    frames past the end of the motion are clamped to its last frame. Shape [B, K * num_joints], K frames.
     """
     command = cast(MotionCommand, env.command_manager.get_term(command_name))
     asset: Entity = env.scene[asset_cfg.name]
     motion = command.motion
-    future = torch.arange(1, num_steps + 1, device=env.device) * stride  # [K]
+    if offsets is None:
+        future = torch.arange(1, num_steps + 1, device=env.device) * stride  # [K]
+    else:
+        future = torch.tensor(offsets, dtype=torch.long, device=env.device)  # [K]
     idx = motion_frames_ahead(command, future)  # [B, K]
     joint_pos = motion.joint_pos[idx] - asset.data.default_joint_pos[:, None]  # [B, K, J]
     return joint_pos.reshape(joint_pos.shape[0], -1)

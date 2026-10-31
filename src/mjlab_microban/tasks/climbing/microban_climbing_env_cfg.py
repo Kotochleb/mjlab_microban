@@ -23,7 +23,7 @@ tasks/tracking/rl_cfg.py.
 
 import math
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import fields, replace
 
 import numpy as np
 
@@ -55,6 +55,7 @@ from mjlab_microban.robot.microban_climb_constants import (
 )
 from mjlab_microban.tasks.climbing import mdp
 from mjlab_microban.tasks.climbing.wall import (
+    COLLISION_FEET,
     COLLISION_HANDLES,
     COLLISION_WORLD,
     ONE_BOX_BODY,
@@ -67,8 +68,31 @@ from mjlab_microban.tasks.climbing.wall import (
 
 END_EFFECTOR_BODY_NAMES = FEET_BODY_NAMES + HANDS_BODY_NAMES
 
-# Number of future motion frames (policy steps, 50 Hz) the policy observes, as a rolling window.
+# [s] maximum episode length in training (a time-out).
+EPISODE_LENGTH_S = 30.0
+
+# [s] the reference holds the climb's final configuration after the motion's end, before the episode ends.
+MOTION_END_HOLD_S = 2.0
+
+# Number of dense future motion frames (policy steps, 50 Hz) at the start of the actor's window.
 FUTURE_WINDOW_STEPS = 20
+# The sparser part of the actor's window: stages with these step gaps, with this many frames each.
+FUTURE_STAGE_GAPS = (2, 3, 4, 5, 6)
+FUTURE_STAGE_FRAMES = (4, 3, 3, 2, 1)
+
+
+def _staged_offsets(dense: int, gaps: tuple[int, ...], frames: tuple[int, ...]) -> tuple[int, ...]:
+    """Steps 1..dense, then for each stage in turn its number of frames, its gap steps apart."""
+    assert len(gaps) == len(frames)
+    offsets = list(range(1, dense + 1))
+    for gap, n in zip(gaps, frames):
+        offsets += [offsets[-1] + gap * (i + 1) for i in range(n)]
+    return tuple(offsets)
+
+
+# Future frames (policy steps ahead) of the actor's reference window: every step for 20 steps, then 4 frames
+# every 2nd step, 3 every 3rd, 3 every 4th, 2 every 5th and 1 every 6th: 33 frames, 65 steps (1.3 s) ahead.
+ACTOR_FUTURE_OFFSETS = _staged_offsets(FUTURE_WINDOW_STEPS, FUTURE_STAGE_GAPS, FUTURE_STAGE_FRAMES)
 
 # Policy steps of history of the actor's proprioceptive terms (the current one and the 4 before it, 0.1 s).
 ACTOR_HISTORY_STEPS = 5
@@ -124,14 +148,17 @@ def _robot_spec_fn(get_spec, trunk_pos):
         spec.body("trunk").pos = trunk_pos
         spec.body("trunk").quat = (1.0, 0.0, 0.0, 0.0)
         # Collision groups (wall.py, COLLISION_WORLD): every robot collision geom is in the world group, the
-        # four balls and the two hand capsules also in the handles group (the inside of the 5-box cups).
-        missing = set(HANDLE_GEOM_NAMES) - {geom.name for geom in spec.geoms}
-        assert not missing, f"handle geoms missing from the robot MJCF: {sorted(missing)}"
+        # four balls and the two hand capsules also in the handles group (the inside of the 5-box cups), the two
+        # foot soles in the feet group (the 5-box ledges).
+        missing = set(HANDLE_GEOM_NAMES + FOOT_SOLE_GEOM_NAMES) - {geom.name for geom in spec.geoms}
+        assert not missing, f"handle / sole geoms missing from the robot MJCF: {sorted(missing)}"
         for geom in spec.geoms:
             if geom.contype or geom.conaffinity:
                 assert geom.contype & COLLISION_WORLD, f"robot geom {geom.name!r} not in the world collision group"
             if geom.name in HANDLE_GEOM_NAMES:
                 geom.contype |= COLLISION_HANDLES
+            if geom.name in FOOT_SOLE_GEOM_NAMES:
+                geom.contype |= COLLISION_FEET
         return spec
 
     return spec_fn
@@ -260,9 +287,18 @@ def make_microban_climbing_env_cfg(
         command_name="motion",
     )
 
+    # Episodes of up to EPISODE_LENGTH_S (a climb's motion ends them sooner, see the motion_end termination).
+    cfg.episode_length_s = EPISODE_LENGTH_S
+
     #---------------------------- Commands --------------------------
     motion_cmd = cfg.commands["motion"]
     assert isinstance(motion_cmd, MotionCommandCfg)
+    # The reference keeps the climb's final configuration for MOTION_END_HOLD_S at its end (then the episode ends,
+    # see the motion_end termination).
+    motion_cmd = mdp.HoldEndMotionCommandCfg(
+        **{f.name: getattr(motion_cmd, f.name) for f in fields(motion_cmd)}, end_hold_s=MOTION_END_HOLD_S
+    )
+    cfg.commands["motion"] = motion_cmd
     motion_cmd.anchor_body_name = "trunk"
     motion_cmd.body_names = TRACKED_BODY_NAMES
     motion_cmd.pose_range = {
@@ -291,16 +327,12 @@ def make_microban_climbing_env_cfg(
         "projected_gravity": ObservationTermCfg(
             func=envs_mdp.projected_gravity, noise=Unoise(n_min=-0.05, n_max=0.05)
         ),
-        # Heading since the episode start, wound up, from a random offset in [0, 2 pi): (cos, sin).
-        "base_yaw": ObservationTermCfg(
-            func=mdp.base_yaw_windup_cos_sin, params={"offset_range": (0.0, 2.0 * math.pi)}
-        ),
         "joint_pos": actor_terms["joint_pos"],
         "joint_vel": actor_terms["joint_vel"],
         "actions": actor_terms["actions"],
         "command": ObservationTermCfg(
             func=mdp.motion_future_joint_pos,
-            params={"command_name": "motion", "num_steps": FUTURE_WINDOW_STEPS},
+            params={"command_name": "motion", "offsets": ACTOR_FUTURE_OFFSETS},
         ),
     }
     # Short history of the proprioceptive terms (the MLP has no memory otherwise). The command is already a
@@ -350,6 +382,21 @@ def make_microban_climbing_env_cfg(
     critic_terms["joint_torques"] = ObservationTermCfg(func=mdp.applied_joint_torques)
     # - the heading, privileged: rotation about the board's z axis relative to the board, no offset: (cos, sin).
     critic_terms["base_yaw"] = ObservationTermCfg(func=mdp.base_yaw_rel_board_cos_sin, params={"board_name": "wall"})
+
+    # Actor: where the reference expects the balls on holds, now and at its future window's frames (averaged over
+    # the skipped frames where the window is sparse). Contacts only: the reference's, no robot state. Not stacked
+    # (a future window, as the command).
+    cfg.observations["actor"].terms["contact_schedule"] = ObservationTermCfg(
+        func=mdp.motion_contact_schedule,
+        params={
+            "command_name": "motion",
+            "site_names": BALL_SITE_NAMES,
+            "offsets": ACTOR_FUTURE_OFFSETS,
+            "hold_positions": holds,
+            "threshold": EXPECTED_CONTACT_THRESHOLD,
+            "contacts_only": True,
+        },
+    )
 
     #---------------------------- Rewards ---------------------------
     # Imitation: DeepMimic's reward (Peng et al., SIGGRAPH 2018), the standard reward for policies tracking
@@ -513,16 +560,18 @@ def make_microban_climbing_env_cfg(
         },
     )
 
-    # Foot sole boxes (85 mm long): shortened by U(0, 5 mm) at the front (box local +y = foot +z), per env and foot;
-    # the heel end stays in place.
+    # Foot sole boxes (85 mm long): shortened by s = 2.5 mm * u^2, u ~ U(0, 1), at the front (box local +y = foot +z),
+    # per env and foot; the heel end stays in place. The square biases s towards 0: mean 0.83 mm, median 0.63 mm,
+    # P(s > 1.25 mm) = 29 %.
     cfg.events["foot_sole_length"] = EventTermCfg(
         mode="startup",
         func=mdp.shorten_box_geom,
         params={
             "asset_cfg": SceneEntityCfg("robot", geom_names=FOOT_SOLE_GEOM_NAMES),
-            "max_shortening": 0.005,
+            "max_shortening": 0.0025,
             "axis": 1,
             "side": 1.0,
+            "power": 2.0,
         },
     )
 
@@ -558,6 +607,17 @@ def make_microban_climbing_env_cfg(
                 "full_steps": 1000 * 24,
             },
         )
+        # Ball sphere radius: 1.5 mm undersized (12.5 -> 11 mm) up to iteration 300, then grown linearly to the
+        # nominal radius at iteration 800.
+        cfg.curriculum["ball_radius"] = CurriculumTermCfg(
+            func=mdp.sphere_radius_curriculum,
+            params={
+                "asset_cfg": SceneEntityCfg("robot", geom_names=BALL_GEOM_NAMES),
+                "undersize": 0.0015,
+                "hold_steps": 300 * 24,
+                "full_steps": 800 * 24,
+            },
+        )
         # Reference motion speed, per env and episode: U(0.95, 1.05) up to iteration 500, then the bounds widen
         # linearly to U(0.9, 1.5) at iteration 1500.
         cfg.curriculum["motion_speed"] = CurriculumTermCfg(
@@ -588,6 +648,11 @@ def make_microban_climbing_env_cfg(
     # Stopgap: rare physics blow-ups (NaN state) under violent early-training actions; reset those envs
     # before their observations are computed (their reward is already zeroed by the reward manager).
     cfg.terminations["nan_detection"] = TerminationTermCfg(func=envs_mdp.nan_detection)
+    # The end of the motion, after MOTION_END_HOLD_S of its final configuration: the episode ends (a time-out, so
+    # the value is bootstrapped there and the climb's end is not a failure).
+    cfg.terminations["motion_end"] = TerminationTermCfg(
+        func=mdp.motion_ended, params={"command_name": "motion"}, time_out=True
+    )
     # The trunk turned away from the board: more than 60 deg about the board's z axis.
     cfg.terminations["base_yaw_rel_board"] = TerminationTermCfg(
         func=mdp.base_yaw_rel_board_exceeded,

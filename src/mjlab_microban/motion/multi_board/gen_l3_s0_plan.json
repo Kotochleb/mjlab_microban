@@ -1,0 +1,22 @@
+{
+  "schema": "contact_plan/1",
+  "wall_id": "l2_s9706",
+  "stances": [
+    {
+      "contacts": {
+        "right_hand": "r23_c31",
+        "left_hand": "r23_c21",
+        "right_foot": "r8_c31",
+        "left_foot": "r8_c21"
+      }
+    },
+    {
+      "contacts": {
+        "right_hand": "r23_c31",
+        "left_hand": "r28_c19",
+        "right_foot": "r8_c31",
+        "left_foot": "r8_c21"
+      }
+    }
+  ]
+}

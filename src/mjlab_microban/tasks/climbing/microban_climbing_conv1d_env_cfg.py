@@ -44,6 +44,8 @@ def make_microban_climbing_conv1d_env_cfg(play: bool = False, **kwargs) -> Manag
 
     # Actor: the future joint positions move to their own group, every step over the next second.
     del cfg.observations["actor"].terms["command"]
+    # The actor's contact schedule is on the MLP variant's sparse window: not in this variant.
+    del cfg.observations["actor"].terms["contact_schedule"]
     cfg.observations[ACTOR_FUTURE_GROUP] = ObservationGroupCfg(
         terms={
             "command": ObservationTermCfg(

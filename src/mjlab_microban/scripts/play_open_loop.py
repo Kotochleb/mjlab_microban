@@ -230,6 +230,8 @@ class OpenLoopPlayer:
 
     def _board_label(self, i: int) -> str:
         b = self.board_set.boards[i]
+        if b.wall.name:
+            return f"{i}: {b.wall.name} (level {b.difficulty})"
         return f"{i}: level {b.wall.level}, seed {b.wall.seed}"
 
     def _load_motion(self, path: Path) -> None:

@@ -22,6 +22,7 @@ from pathlib import Path
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.managers.curriculum_manager import CurriculumTermCfg
 from mjlab.managers.event_manager import EventTermCfg
+from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.managers.observation_manager import ObservationTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.tasks.tracking.mdp import MotionCommandCfg
@@ -30,11 +31,25 @@ from mjlab_microban.tasks.climbing import multi_board
 from mjlab_microban.tasks.climbing.microban_climbing_env_cfg import make_microban_climbing_env_cfg
 from mjlab_microban.tasks.climbing.multi_board import BoardSet, MultiBoardMotionCommandCfg
 
-# Board curriculum (multi_board.board_levels): up a level after an episode lasting >= 90 % of the maximum episode
-# length, down a level after one lasting < 50 % of it; all envs start on the easiest level.
+# Board curriculum (multi_board.board_levels): up a level after a successful full episode (to the end of its motion,
+# or >= 90 % of its limit with its board's horizon at the maximum), down a level after one failing before 50 % of its
+# limit; all envs start on the easiest level.
 CURRICULUM_UP_FRACTION = 0.9
 CURRICULUM_DOWN_FRACTION = 0.5
 CURRICULUM_MAX_INIT_LEVEL = 0
+# Per-board episode horizons and sampling bias (multi_board.board_horizons): from HORIZON_INIT_S, within
+# [HORIZON_MIN_S, the maximum episode length]; x HORIZON_GROW per PPO iteration while the board's success rate is
+# above HORIZON_UP_RATE, x HORIZON_SHRINK while below HORIZON_DOWN_RATE. Boards are sampled with weight
+# 1 - success rate (at least HORIZON_MIN_BIAS).
+HORIZON_MIN_S = 5.0
+HORIZON_INIT_S = 10.0
+HORIZON_UP_RATE = 0.8
+HORIZON_DOWN_RATE = 0.5
+HORIZON_GROW = 1.25
+HORIZON_SHRINK = 0.8
+HORIZON_EMA = 0.2
+HORIZON_MIN_BIAS = 0.2
+HORIZON_UPDATE_STEPS = 24  # one PPO iteration (rl_cfg num_steps_per_env)
 
 
 def to_multi_board(cfg: ManagerBasedRlEnvCfg, board_set: BoardSet, play: bool = False) -> ManagerBasedRlEnvCfg:
@@ -55,19 +70,44 @@ def to_multi_board(cfg: ManagerBasedRlEnvCfg, board_set: BoardSet, play: bool = 
         board_offsets=board_set.offsets,
         board_levels=board_set.board_levels,
         level_names=level_names,
+        board_weights=board_set.weights,
     )
     cfg.commands["motion"].motion_file = board_set.boards[0].motion_file
 
-    # Critic: the contact schedule against each board's own holds.
-    old = cfg.observations["critic"].terms["motion_contact_schedule"]
-    params = {k: v for k, v in old.params.items() if k != "hold_positions"}
-    params["board_hold_positions"] = multi_board.board_hold_positions(board_set)
-    cfg.observations["critic"].terms["motion_contact_schedule"] = ObservationTermCfg(
-        func=multi_board.multi_board_motion_contact_schedule, params=params
-    )
+    # Critic (and actor): the contact schedule against each board's own holds.
+    for group, name in (("critic", "motion_contact_schedule"), ("actor", "contact_schedule")):
+        if name not in cfg.observations[group].terms:
+            continue
+        old = cfg.observations[group].terms[name]
+        params = {k: v for k, v in old.params.items() if k != "hold_positions"}
+        params["board_hold_positions"] = multi_board.board_hold_positions(board_set)
+        cfg.observations[group].terms[name] = ObservationTermCfg(
+            func=multi_board.multi_board_motion_contact_schedule, params=params
+        )
 
-    # Curriculum over the boards' levels.
+    # Curriculum over the boards' levels, after the per-board horizons (which judge the episodes on the boards they
+    # ended on, before board_levels moves the envs on).
     if not play:
+        cfg.curriculum["board_horizons"] = CurriculumTermCfg(
+            func=multi_board.board_horizons,
+            params={
+                "command_name": "motion",
+                "min_s": HORIZON_MIN_S,
+                "max_s": cfg.episode_length_s,
+                "init_s": HORIZON_INIT_S,
+                "up_rate": HORIZON_UP_RATE,
+                "down_rate": HORIZON_DOWN_RATE,
+                "grow": HORIZON_GROW,
+                "shrink": HORIZON_SHRINK,
+                "ema": HORIZON_EMA,
+                "min_bias": HORIZON_MIN_BIAS,
+                "update_steps": HORIZON_UPDATE_STEPS,
+            },
+        )
+        # Episodes end at their limit (a time-out: not a failure).
+        cfg.terminations["episode_limit"] = TerminationTermCfg(
+            func=multi_board.episode_limit_reached, params={"command_name": "motion"}, time_out=True
+        )
         cfg.curriculum["board_levels"] = CurriculumTermCfg(
             func=multi_board.board_levels,
             params={

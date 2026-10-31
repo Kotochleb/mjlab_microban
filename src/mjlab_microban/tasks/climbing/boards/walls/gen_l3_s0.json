@@ -1,0 +1,217 @@
+{
+ "name": "gen_l3_s0",
+ "description": "level 3 wall gen_l3_s0 (rock-climbing-workshop data/walls/gen_l3_s0.json, converted from hold positions to grid holes)",
+ "level": 3,
+ "holds": [
+  {
+   "col": 21,
+   "row": 8
+  },
+  {
+   "col": 31,
+   "row": 8
+  },
+  {
+   "col": 16,
+   "row": 13
+  },
+  {
+   "col": 21,
+   "row": 13
+  },
+  {
+   "col": 31,
+   "row": 13
+  },
+  {
+   "col": 36,
+   "row": 13
+  },
+  {
+   "col": 21,
+   "row": 18
+  },
+  {
+   "col": 27,
+   "row": 18
+  },
+  {
+   "col": 31,
+   "row": 18
+  },
+  {
+   "col": 21,
+   "row": 23
+  },
+  {
+   "col": 31,
+   "row": 23
+  },
+  {
+   "col": 18,
+   "row": 24
+  },
+  {
+   "col": 28,
+   "row": 24
+  },
+  {
+   "col": 14,
+   "row": 26
+  },
+  {
+   "col": 24,
+   "row": 26
+  },
+  {
+   "col": 9,
+   "row": 28
+  },
+  {
+   "col": 19,
+   "row": 28
+  },
+  {
+   "col": 9,
+   "row": 33
+  },
+  {
+   "col": 13,
+   "row": 33
+  },
+  {
+   "col": 19,
+   "row": 33
+  },
+  {
+   "col": 9,
+   "row": 38
+  },
+  {
+   "col": 19,
+   "row": 38
+  },
+  {
+   "col": 9,
+   "row": 43
+  },
+  {
+   "col": 19,
+   "row": 43
+  },
+  {
+   "col": 9,
+   "row": 48
+  },
+  {
+   "col": 19,
+   "row": 48
+  },
+  {
+   "col": 9,
+   "row": 53
+  },
+  {
+   "col": 19,
+   "row": 53
+  },
+  {
+   "col": 23,
+   "row": 53
+  },
+  {
+   "col": 9,
+   "row": 58
+  },
+  {
+   "col": 19,
+   "row": 58
+  },
+  {
+   "col": 25,
+   "row": 58
+  },
+  {
+   "col": 9,
+   "row": 63
+  },
+  {
+   "col": 19,
+   "row": 63
+  },
+  {
+   "col": 22,
+   "row": 63
+  },
+  {
+   "col": 9,
+   "row": 68
+  },
+  {
+   "col": 16,
+   "row": 68
+  },
+  {
+   "col": 19,
+   "row": 68
+  },
+  {
+   "col": 9,
+   "row": 73
+  },
+  {
+   "col": 13,
+   "row": 73
+  },
+  {
+   "col": 16,
+   "row": 73
+  },
+  {
+   "col": 19,
+   "row": 73
+  },
+  {
+   "col": 9,
+   "row": 78
+  },
+  {
+   "col": 19,
+   "row": 78
+  },
+  {
+   "col": 9,
+   "row": 83
+  },
+  {
+   "col": 13,
+   "row": 83
+  },
+  {
+   "col": 16,
+   "row": 83
+  },
+  {
+   "col": 19,
+   "row": 83
+  }
+ ],
+ "start": {
+  "right_hand": {
+   "col": 31,
+   "row": 23
+  },
+  "left_hand": {
+   "col": 21,
+   "row": 23
+  },
+  "right_foot": {
+   "col": 31,
+   "row": 8
+  },
+  "left_foot": {
+   "col": 21,
+   "row": 8
+  }
+ }
+}

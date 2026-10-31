@@ -6,7 +6,7 @@ y into the wall, z up). Shown:
   - the simulator's collision geometry: the hulls + skin patches, and the cup spheres
   - the centre of the mesh: its centre of mass (volume) and the centre of its bounding box, and the socket frame
   - a ball of the robot (r = 12.5 mm) sitting in the socket
-  - the 3-box, 5-box and 1-box approximations, chosen from a dropdown
+  - the 3-box, 5-box and 1-box approximations, chosen from a dropdown, optionally with the name of each box
 
 Usage:
     uv run python src/mjlab_microban/scripts/view_hold_boxes.py [--port 8080]
@@ -101,15 +101,20 @@ def main() -> None:
 
     # ---- approximations ---------------------------------------------------------------------------------
     approx_handles: dict[str, list] = {}
+    label_handles: dict[str, list] = {}
     for key, boxes in hold_boxes.APPROXIMATIONS.items():
         handles = []
+        label_handles[key] = [
+            server.scene.add_label(f"/approx_labels/{key}/{b.name}", b.name, position=tuple(b.center), visible=False)
+            for b in boxes
+        ]
         for b in boxes:
             handles.append(server.scene.add_box(
-                f"/approx/{key}/{b.name}", dimensions=tuple(2 * b.half_size), position=tuple(b.center),
+                f"/approx/{key}/{b.name}", dimensions=tuple(2 * b.half_size), position=tuple(b.center), wxyz=b.quat,
                 color=APPROX_COLORS[key], opacity=0.55,
             ))
             handles.append(server.scene.add_box(
-                f"/approx/{key}/{b.name}_edges", dimensions=tuple(2 * b.half_size), position=tuple(b.center),
+                f"/approx/{key}/{b.name}_edges", dimensions=tuple(2 * b.half_size), position=tuple(b.center), wxyz=b.quat,
                 color=APPROX_COLORS[key], wireframe=True,
             ))
         approx_handles[key] = handles
@@ -122,11 +127,16 @@ def main() -> None:
     with server.gui.add_folder("Approximation"):
         approx = server.gui.add_dropdown("Show", options=("three_box", "five_box", "one_box", "all", "none"),
                                          initial_value="three_box")
+        show_labels = server.gui.add_checkbox("Box names", initial_value=False)
 
-    @approx.on_update
-    def _(_) -> None:
+    def update_approx() -> None:
         for key, handles in approx_handles.items():
-            toggle(handles, approx.value in (key, "all"))
+            shown = approx.value in (key, "all")
+            toggle(handles, shown)
+            toggle(label_handles[key], shown and show_labels.value)
+
+    approx.on_update(lambda _: update_approx())
+    show_labels.on_update(lambda _: update_approx())
 
     for key in ("five_box", "one_box"):
         toggle(approx_handles[key], False)

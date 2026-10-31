@@ -1,0 +1,245 @@
+{
+ "name": "gen_l3_s1",
+ "description": "level 3 wall gen_l3_s1 (rock-climbing-workshop data/walls/gen_l3_s1.json, converted from hold positions to grid holes)",
+ "level": 3,
+ "holds": [
+  {
+   "col": 18,
+   "row": 8
+  },
+  {
+   "col": 28,
+   "row": 8
+  },
+  {
+   "col": 18,
+   "row": 13
+  },
+  {
+   "col": 22,
+   "row": 13
+  },
+  {
+   "col": 28,
+   "row": 13
+  },
+  {
+   "col": 34,
+   "row": 13
+  },
+  {
+   "col": 18,
+   "row": 18
+  },
+  {
+   "col": 28,
+   "row": 18
+  },
+  {
+   "col": 31,
+   "row": 18
+  },
+  {
+   "col": 12,
+   "row": 23
+  },
+  {
+   "col": 18,
+   "row": 23
+  },
+  {
+   "col": 24,
+   "row": 23
+  },
+  {
+   "col": 28,
+   "row": 23
+  },
+  {
+   "col": 15,
+   "row": 28
+  },
+  {
+   "col": 18,
+   "row": 28
+  },
+  {
+   "col": 28,
+   "row": 28
+  },
+  {
+   "col": 22,
+   "row": 30
+  },
+  {
+   "col": 25,
+   "row": 30
+  },
+  {
+   "col": 32,
+   "row": 30
+  },
+  {
+   "col": 35,
+   "row": 30
+  },
+  {
+   "col": 38,
+   "row": 30
+  },
+  {
+   "col": 30,
+   "row": 34
+  },
+  {
+   "col": 40,
+   "row": 34
+  },
+  {
+   "col": 30,
+   "row": 39
+  },
+  {
+   "col": 33,
+   "row": 39
+  },
+  {
+   "col": 36,
+   "row": 39
+  },
+  {
+   "col": 40,
+   "row": 39
+  },
+  {
+   "col": 30,
+   "row": 44
+  },
+  {
+   "col": 40,
+   "row": 44
+  },
+  {
+   "col": 30,
+   "row": 49
+  },
+  {
+   "col": 40,
+   "row": 49
+  },
+  {
+   "col": 27,
+   "row": 50
+  },
+  {
+   "col": 37,
+   "row": 50
+  },
+  {
+   "col": 23,
+   "row": 52
+  },
+  {
+   "col": 33,
+   "row": 52
+  },
+  {
+   "col": 18,
+   "row": 54
+  },
+  {
+   "col": 28,
+   "row": 54
+  },
+  {
+   "col": 11,
+   "row": 56
+  },
+  {
+   "col": 14,
+   "row": 56
+  },
+  {
+   "col": 24,
+   "row": 56
+  },
+  {
+   "col": 14,
+   "row": 61
+  },
+  {
+   "col": 24,
+   "row": 61
+  },
+  {
+   "col": 10,
+   "row": 66
+  },
+  {
+   "col": 14,
+   "row": 66
+  },
+  {
+   "col": 24,
+   "row": 66
+  },
+  {
+   "col": 14,
+   "row": 71
+  },
+  {
+   "col": 20,
+   "row": 71
+  },
+  {
+   "col": 24,
+   "row": 71
+  },
+  {
+   "col": 30,
+   "row": 71
+  },
+  {
+   "col": 14,
+   "row": 76
+  },
+  {
+   "col": 19,
+   "row": 76
+  },
+  {
+   "col": 24,
+   "row": 76
+  },
+  {
+   "col": 14,
+   "row": 81
+  },
+  {
+   "col": 20,
+   "row": 81
+  },
+  {
+   "col": 24,
+   "row": 81
+  }
+ ],
+ "start": {
+  "right_hand": {
+   "col": 28,
+   "row": 23
+  },
+  "left_hand": {
+   "col": 18,
+   "row": 23
+  },
+  "right_foot": {
+   "col": 28,
+   "row": 8
+  },
+  "left_foot": {
+   "col": 18,
+   "row": 8
+  }
+ }
+}

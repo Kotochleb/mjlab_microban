@@ -11,14 +11,19 @@ A JSON file (``boards/multi_board.json`` by default, or the file in $MICROBAN_BO
       "boards": [
         {"level": 1, "seed": 0, "motion": "l1s0.npz"},
         {"level": 2, "seed": 13},
+        {"wall": "l2_s3"},
         ...
       ]
     }
 
-Each board is a climbing_sim route ``generate_wall(level, seed)`` with its planned climb, a motion .npz of the
+Within a curriculum level a board is drawn with its ``weight`` (default 1, or ``json_board_weight`` = 3 for a
+board on a wall JSON file, so the curriculum prefers those).
+
+Each board is a climbing_sim route ``generate_wall(level, seed)``, or a wall JSON file (``wall``: a file of
+boards/walls by its stem, a bundled wall N1-N3, or a path; its level is the file's ``level``), with its planned climb, a motion .npz of the
 climbing task (rock-climbing-workshop plan_sim_wall.py --save-npz, then scripts/workshop_to_npz.py;
 scripts/make_multi_board_motions.py does both for every board of the file). ``motion`` is relative to
-src/mjlab_microban/motion (default: ``multi_board/l<level>s<seed>.npz``). A board's difficulty is its wall level
+src/mjlab_microban/motion (default: ``multi_board/l<level>s<seed>.npz``, or ``multi_board/<wall>.npz``). A board's difficulty is its wall level
 (``difficulty`` overrides it); the curriculum levels are the distinct difficulties, easiest first.
 
 Scene
@@ -50,17 +55,18 @@ import torch
 from mjlab.entity import Entity, EntityCfg
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.managers.scene_entity_config import SceneEntityCfg
-from mjlab.tasks.tracking.mdp import MotionCommand, MotionCommandCfg
+from mjlab.tasks.tracking.mdp import MotionCommand
 from mjlab.tasks.tracking.mdp.commands import MotionLoader
 from mjlab.utils.lab_api.math import quat_from_euler_xyz, quat_mul, sample_uniform
 
-from mjlab_microban.tasks.climbing.mdp import motion_contact_schedule
+from mjlab_microban.tasks.climbing.mdp import HoldEndMotionCommandCfg, hold_final_frame, motion_contact_schedule
 from mjlab_microban.tasks.climbing.wall import (
     WallSpec,
     get_multi_board_spec,
     hold_positions,
     motion_wall,
     used_holds,
+    wall_file,
 )
 
 BOARDS_DIR = Path(__file__).parent / "boards"
@@ -68,6 +74,9 @@ DEFAULT_BOARDS_FILE = BOARDS_DIR / "multi_board.json"
 BOARDS_FILE_ENV = "MICROBAN_BOARDS_FILE"
 MOTION_DIR = Path(__file__).resolve().parents[2] / "motion"  # src/mjlab_microban/motion
 DEFAULT_SPACING = 1.2  # [m] between board centres (the walls are 0.8 m wide)
+# Default sampling weight of a board on a wall JSON file ("wall"), against 1 for a generated one: within a curriculum
+# level, the curriculum prefers the walls of the JSON files. Board file: "json_board_weight", or a board's "weight".
+DEFAULT_JSON_BOARD_WEIGHT = 3.0
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -80,9 +89,15 @@ class Board:
     wall: WallSpec
     motion_file: str
     difficulty: int  # the wall level, unless the board file says otherwise
+    weight: float = 1.0  # relative probability of the board among the boards of its curriculum level
 
     def default_motion_name(self) -> str:
-        return f"l{self.wall.level}s{self.wall.seed}"
+        return motion_stem(self.wall)
+
+
+def motion_stem(wall: WallSpec) -> str:
+    """Default motion file stem of a board: l<level>s<seed>, or the wall file's stem."""
+    return Path(wall.name).stem if wall.name else f"l{wall.level}s{wall.seed}"
 
 
 @dataclass(frozen=True)
@@ -102,6 +117,11 @@ class BoardSet:
         return tuple(self.difficulties.index(b.difficulty) for b in self.boards)
 
     @property
+    def weights(self) -> tuple[float, ...]:
+        """Sampling weight of each board within its curriculum level."""
+        return tuple(b.weight for b in self.boards)
+
+    @property
     def offsets(self) -> tuple[tuple[float, float, float], ...]:
         """Position of each board's origin in the world (env frame axes): along y, ``spacing`` apart."""
         return tuple((0.0, i * self.spacing, 0.0) for i in range(len(self.boards)))
@@ -118,13 +138,25 @@ def load_board_set(path: str | Path | None = None) -> BoardSet:
     path = Path(path) if path is not None else boards_file()
     data = json.loads(path.read_text())
     boards = []
+    json_weight = float(data.get("json_board_weight", DEFAULT_JSON_BOARD_WEIGHT))
     for i, entry in enumerate(data["boards"]):
-        if "level" not in entry or "seed" not in entry:
-            raise ValueError(f"{path}: board {i} needs a 'level' and a 'seed', got {entry}")
-        wall = WallSpec(level=int(entry["level"]), seed=int(entry["seed"]))
-        motion = entry.get("motion", f"multi_board/l{wall.level}s{wall.seed}.npz")
+        if "wall" in entry:
+            # A wall JSON file (by name: boards/walls/<name>.json or N1-N3, or a path); its level is its "level".
+            wall = WallSpec(name=str(entry["wall"]))
+            level = entry.get("difficulty", json.loads(wall_file(wall.name).read_text()).get("level"))
+            if level is None:
+                raise ValueError(f"{path}: board {i} ({wall}) needs a 'difficulty' (its wall file has no 'level')")
+        elif "level" in entry and "seed" in entry:
+            wall = WallSpec(level=int(entry["level"]), seed=int(entry["seed"]))
+            level = entry.get("difficulty", wall.level)
+        else:
+            raise ValueError(f"{path}: board {i} needs a 'wall', or a 'level' and a 'seed', got {entry}")
+        motion = entry.get("motion", f"multi_board/{motion_stem(wall)}.npz")
         motion_path = Path(motion) if Path(motion).is_absolute() else MOTION_DIR / motion
-        boards.append(Board(wall=wall, motion_file=str(motion_path), difficulty=int(entry.get("difficulty", wall.level))))
+        weight = float(entry.get("weight", json_weight if wall.name else 1.0))
+        if weight <= 0:
+            raise ValueError(f"{path}: board {i} ({wall}) needs a positive 'weight', got {weight}")
+        boards.append(Board(wall=wall, motion_file=str(motion_path), difficulty=int(level), weight=weight))
     if not boards:
         raise ValueError(f"{path}: no boards")
     return BoardSet(boards=tuple(boards), spacing=float(data.get("spacing", DEFAULT_SPACING)), source=str(path))
@@ -213,6 +245,9 @@ class MultiBoardMotionCommand(MotionCommand):
         super().__init__(cfg, env)
 
         motions = [MotionLoader(f, self.body_indexes, device=self.device) for f in cfg.motion_files]
+        self.end_hold_frames = round(cfg.end_hold_s / env.step_dt)  # each motion's final pose, held at its end
+        for m in motions:
+            hold_final_frame(m, self.end_hold_frames)
         lengths = [m.time_step_total for m in motions]
         self.motion = _ConcatenatedMotion(motions, cfg.segment_padding)
         starts = np.concatenate([[0], np.cumsum(np.array(lengths) + cfg.segment_padding)[:-1]])
@@ -229,6 +264,13 @@ class MultiBoardMotionCommand(MotionCommand):
         self.level_count = torch.tensor([len(p) for p in per_level], device=self.device)
         width = max(len(p) for p in per_level)
         self.level_boards = torch.tensor([p + [p[0]] * (width - len(p)) for p in per_level], device=self.device)
+        # Sampling weights of the boards of each level (0 on the padding), board_weights (default: all 1).
+        weights = cfg.board_weights or (1.0,) * nb
+        if len(weights) != nb or min(weights) <= 0:
+            raise ValueError(f"board_weights needs one positive weight per board, got {weights}")
+        self.level_weights = torch.tensor(
+            [[weights[b] for b in p] + [0.0] * (width - len(p)) for p in per_level], device=self.device
+        )
 
         # Adaptive sampling, per board: bins of 1 s of its motion.
         steps_per_s = 1.0 / env.step_dt
@@ -237,6 +279,16 @@ class MultiBoardMotionCommand(MotionCommand):
         self.bin_valid = torch.arange(self.bin_count, device=self.device)[None] < self.board_bin_count[:, None]
         self.bin_failed_count = torch.zeros(nb, self.bin_count, device=self.device)
         self._current_bin_failed = torch.zeros(nb, self.bin_count, device=self.device)
+
+        # Per-board episode horizons and sampling bias (set by the board_horizons curriculum; without it, no limit
+        # and no bias): the horizon [steps] and success rate of each board, the bias multiplying its sampling weight,
+        # and each env's episode limit [steps], set when its motion is resampled.
+        no_limit = 1 << 30
+        self.board_horizon = torch.full((nb,), no_limit, dtype=torch.long, device=self.device)
+        self.max_horizon = no_limit
+        self.board_success = torch.full((nb,), 0.5, device=self.device)
+        self.board_bias = torch.ones(nb, device=self.device)
+        self.episode_limit = torch.full((self.num_envs,), no_limit, dtype=torch.long, device=self.device)
 
         self.board_ids = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.metrics["board"] = torch.zeros(self.num_envs, device=self.device)
@@ -252,8 +304,12 @@ class MultiBoardMotionCommand(MotionCommand):
     # Boards.
 
     def sample_boards(self, levels: torch.Tensor) -> torch.Tensor:
-        """A random board of each given curriculum level."""
-        k = (torch.rand(levels.shape, device=self.device) * self.level_count[levels]).long()
+        """A random board of each given curriculum level, drawn with the boards' weights (board_weights) times
+        their sampling bias (board_bias: boards the robot does well on less often, see board_horizons)."""
+        if levels.numel() == 0:
+            return levels
+        weights = self.level_weights[levels] * self.board_bias[self.level_boards[levels]]
+        k = torch.multinomial(weights, 1).squeeze(-1)
         return self.level_boards[levels, k]
 
     def set_boards(self, env_ids: torch.Tensor, board_ids: torch.Tensor) -> None:
@@ -321,8 +377,12 @@ class MultiBoardMotionCommand(MotionCommand):
     def _resample_command(self, env_ids: torch.Tensor):
         # MotionCommand._resample_command, with the time step sampled on each env's board.
         board = self.board_ids[env_ids]
-        self.time_steps[env_ids] = self.segment_start[board] + self._sample_local_steps(env_ids, board)
+        local = self._sample_local_steps(env_ids, board)
+        self.time_steps[env_ids] = self.segment_start[board] + local
         self.metrics["board"][env_ids] = board.float()
+        # The episode's limit: its board's horizon, at most the rest of the motion (to the end of its final hold).
+        remaining = (self.segment_length[board] - 1 - local).clamp(min=1)
+        self.episode_limit[env_ids] = torch.minimum(self.board_horizon[board], remaining)
 
         root_pos = self.body_pos_w[env_ids, 0].clone()
         root_ori = self.body_quat_w[env_ids, 0].clone()
@@ -384,7 +444,7 @@ class MultiBoardMotionCommand(MotionCommand):
 
 
 @dataclass(kw_only=True)
-class MultiBoardMotionCommandCfg(MotionCommandCfg):
+class MultiBoardMotionCommandCfg(HoldEndMotionCommandCfg):
     """motion_file is set to the first board's motion (the train / play scripts check that it exists)."""
 
     motion_file: str = ""
@@ -392,6 +452,7 @@ class MultiBoardMotionCommandCfg(MotionCommandCfg):
     board_offsets: tuple[tuple[float, float, float], ...] = ()  # board origins in the world
     board_levels: tuple[int, ...] = ()  # curriculum level of each board, 0 = easiest
     level_names: tuple[str, ...] = ()  # name of each curriculum level, for the logs
+    board_weights: tuple[float, ...] = ()  # sampling weight of each board within its level (default: all 1)
     # Copies of each motion's last frame after it: the furthest frame ahead any term reads (t + k, k <= padding).
     segment_padding: int = 100
 
@@ -406,10 +467,13 @@ class MultiBoardMotionCommandCfg(MotionCommandCfg):
 
 class board_levels:
     """Board curriculum, as the rough-terrain curriculum of the locomotion tasks (terrain_levels_vel): each env has
-    a level (0 = the easiest boards); at its reset, an env that lasted at least ``up_fraction`` of the maximum
-    episode length (it tracked its climb without failing) moves one level up, one that lasted less than
-    ``down_fraction`` of it moves one level down. An env moving up from the top level goes to a random level (as
-    TerrainEntity.update_env_origins). Its next board is a random board of its level.
+    a level (0 = the easiest boards); at its reset, an env whose episode succeeded (it ended by a time-out, not a
+    failure termination) moves one level up if the episode was a full one: it ended at the end of its motion (the
+    termination ``success_term``, however short the episode), or it lasted at least ``up_fraction`` of its limit with
+    its board's horizon at the maximum (board_horizons; without it, the maximum episode length). An env whose
+    episode failed before ``down_fraction`` of its limit moves one level down. An env moving up from the top level
+    goes to a random level (as TerrainEntity.update_env_origins). Its next board is a random board of its level
+    (MultiBoardMotionCommand.sample_boards, with the boards' sampling bias).
 
     The envs start at a random level in 0..max_init_level.
     """
@@ -431,14 +495,26 @@ class board_levels:
         up_fraction: float = 0.9,
         down_fraction: float = 0.5,
         max_init_level: int = 0,
+        success_term: str = "motion_end",
     ) -> dict[str, torch.Tensor]:
         del max_init_level
         command = cast(MultiBoardMotionCommand, env.command_manager.get_term(command_name))
         steps = env.episode_length_buf[env_ids]
         ran = steps > 0  # not the first reset of the env (nothing to judge)
-        fraction = steps.float() / env.max_episode_length
-        move_up = ran & (fraction >= up_fraction)
-        move_down = ran & (fraction < down_fraction) & ~move_up
+        # The curriculum runs at the reset, before the termination buffers are cleared and the motion resampled:
+        # why each episode ended, and its limit and board.
+        terms = env.termination_manager
+        failed = terms.terminated[env_ids]
+        finished = (
+            terms.get_term(success_term)[env_ids]
+            if success_term in terms.active_terms
+            else torch.zeros_like(ran)
+        )
+        limit = command.episode_limit[env_ids].clamp(max=env.max_episode_length).float()
+        at_max = command.board_horizon[command.board_ids[env_ids]] >= min(command.max_horizon, env.max_episode_length)
+        fraction = steps.float() / limit
+        move_up = ran & ~failed & (finished | (at_max & (fraction >= up_fraction)))
+        move_down = ran & failed & (fraction < down_fraction)
 
         levels = self.levels[env_ids] + move_up.long() - move_down.long()
         levels = torch.where(
@@ -454,6 +530,92 @@ class board_levels:
         for lv, name in enumerate(self.level_names):
             result[f"frac_level_{name}"] = (self.levels == lv).float().mean()
         return result
+
+
+class board_horizons:
+    """Per-board episode horizons and sampling bias, from how well the robot does on each board.
+
+    An episode succeeds when it ends by a time-out (its limit, the end of its motion or the maximum episode length),
+    and fails when a failure termination ends it. Every ``update_steps`` env steps, each board's success rate (an
+    exponential moving average with ``ema``, over the episodes that ended on it since the last update) moves its
+    horizon: up by ``grow`` above ``up_rate``, down by ``shrink`` below ``down_rate``, within [min_s, max_s] (from
+    init_s). An episode's limit is its board's horizon, at most the rest of its motion (MultiBoardMotionCommand).
+    The board's sampling weight (within its level) is multiplied by its bias, 1 - success rate (at least
+    ``min_bias``): boards the robot does well on come up less often, with longer episodes; boards it struggles on
+    more often, with shorter ones. Runs before board_levels (which moves the envs to their next boards).
+    """
+
+    def __init__(self, cfg, env: ManagerBasedRlEnv):
+        p = cfg.params
+        command = env.command_manager.get_term(p["command_name"])
+        assert isinstance(command, MultiBoardMotionCommand), "board_horizons needs a MultiBoardMotionCommand"
+        steps = lambda s: max(1, round(s / env.step_dt))  # noqa: E731
+        self.min_steps = steps(p.get("min_s", 5.0))
+        self.max_steps = min(steps(p.get("max_s", 30.0)), int(env.max_episode_length))
+        command.max_horizon = self.max_steps
+        command.board_horizon[:] = min(max(steps(p.get("init_s", 10.0)), self.min_steps), self.max_steps)
+        nb = command.num_boards
+        self._episodes = torch.zeros(nb, device=env.device)
+        self._successes = torch.zeros(nb, device=env.device)
+        self._next_update = int(p.get("update_steps", 24))
+        self.board_names = tuple(Path(f).stem for f in command.cfg.motion_files)
+
+    def __call__(
+        self,
+        env: ManagerBasedRlEnv,
+        env_ids: torch.Tensor,
+        command_name: str,
+        min_s: float = 5.0,
+        max_s: float = 30.0,
+        init_s: float = 10.0,
+        up_rate: float = 0.8,
+        down_rate: float = 0.5,
+        grow: float = 1.25,
+        shrink: float = 0.8,
+        ema: float = 0.2,
+        min_bias: float = 0.2,
+        update_steps: int = 24,
+    ) -> dict[str, torch.Tensor]:
+        del min_s, max_s, init_s
+        command = cast(MultiBoardMotionCommand, env.command_manager.get_term(command_name))
+        ran = env.episode_length_buf[env_ids] > 0  # not the first reset of the env (nothing to judge)
+        success = ran & ~env.termination_manager.terminated[env_ids]
+        board = command.board_ids[env_ids]  # the board of the episode that ended (board_levels runs after this)
+        self._episodes.index_add_(0, board, ran.float())
+        self._successes.index_add_(0, board, success.float())
+
+        if env.common_step_counter >= self._next_update:
+            self._next_update = env.common_step_counter + update_steps
+            seen = self._episodes > 0
+            rate = self._successes / self._episodes.clamp(min=1.0)
+            command.board_success = torch.where(seen, (1 - ema) * command.board_success + ema * rate, command.board_success)
+            s = command.board_success
+            horizon = command.board_horizon.float()
+            horizon = torch.where(seen & (s > up_rate), horizon * grow, horizon)
+            horizon = torch.where(seen & (s < down_rate), horizon * shrink, horizon)
+            command.board_horizon = horizon.round().long().clamp(self.min_steps, self.max_steps)
+            command.board_bias = (1.0 - s).clamp(min=min_bias)
+            self._episodes.zero_()
+            self._successes.zero_()
+
+        horizon_s = command.board_horizon.float() * env.step_dt
+        result = {"horizon_s_mean": horizon_s.mean(), "success_mean": command.board_success.mean()}
+        for b, name in enumerate(self.board_names):
+            result[f"horizon_s_{name}"] = horizon_s[b]
+            result[f"success_{name}"] = command.board_success[b]
+            result[f"bias_{name}"] = command.board_bias[b]
+        return result
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Terminations
+# ---------------------------------------------------------------------------------------------------------
+
+
+def episode_limit_reached(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor:
+    """True once the env's episode has lasted its limit (MultiBoardMotionCommand.episode_limit, see board_horizons)."""
+    command = cast(MultiBoardMotionCommand, env.command_manager.get_term(command_name))
+    return env.episode_length_buf >= command.episode_limit
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -476,15 +638,16 @@ class multi_board_motion_contact_schedule(motion_contact_schedule):
         contact, next_frame, next_pos = [], [], []
         for b, (start, end) in enumerate(zip(command.segment_start.tolist(), ends, strict=True)):
             holds = torch.tensor(holds_per_board[b], dtype=torch.float32, device=env.device)
-            c, f, p = self._schedule(ball_ref[start:end], holds, threshold)
+            plan = self._planned_contacts(cfg, command.cfg.motion_files[b], end - start, env.device)
+            c, f, p = self._schedule(ball_ref[start:end], holds, threshold, plan)
             contact.append(c)
             next_frame.append(f + start)
             next_pos.append(p)
         self.contact = torch.cat(contact)
         self.next_frame = torch.cat(next_frame)
         self.next_pos = torch.cat(next_pos)
-        self.future = torch.tensor(cfg.params["offsets"], device=env.device)
-        assert int(self.future.max()) <= command.cfg.segment_padding
+        self._set_future(cfg.params["offsets"], env.device)
+        assert int(self.window.max()) <= command.cfg.segment_padding
         self.step_dt = env.step_dt
 
     def __call__(
@@ -497,9 +660,13 @@ class multi_board_motion_contact_schedule(motion_contact_schedule):
         threshold: float = 0.003,
         max_time: float = 1.0,
         asset_name: str = "robot",
+        contacts_only: bool = False,
+        contact_source: str = "plan",
     ) -> torch.Tensor:
         del board_hold_positions
-        return super().__call__(env, command_name, site_names, offsets, (), threshold, max_time, asset_name)
+        return super().__call__(
+            env, command_name, site_names, offsets, (), threshold, max_time, asset_name, contacts_only, contact_source
+        )
 
 
 __all__ = [
@@ -508,9 +675,11 @@ __all__ = [
     "MultiBoardMotionCommand",
     "MultiBoardMotionCommandCfg",
     "board_hold_positions",
+    "board_horizons",
     "board_levels",
     "boards_file",
     "check_board_motion",
+    "episode_limit_reached",
     "load_board_set",
     "make_multi_board_wall_cfg",
     "multi_board_motion_contact_schedule",

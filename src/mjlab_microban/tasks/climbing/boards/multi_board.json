@@ -1,5 +1,5 @@
 {
-  "description": "Boards of the multi-board climbing env (tasks/climbing/multi_board.py): one level 1 board (curriculum level 0, the easiest) and nine level 2 boards. Level 2 seeds: the longest (partial) climbs rock-climbing-workshop's planner finds and its trajectory optimiser solves. Motions: src/mjlab_microban/motion/<motion>, made by scripts/make_multi_board_motions.py.",
+  "description": "Boards of the multi-board climbing env (tasks/climbing/multi_board.py): one level 1 board (curriculum level 0, the easiest) and level 2 boards. Level 2 seeds: the longest (partial) climbs rock-climbing-workshop's planner finds and its trajectory optimiser solves; the partial climbs are trained on as they are, boards whose climb fails are left out. Wall JSON boards: boards/walls/<wall>.json (from rock-climbing-workshop data/walls; gen_l3_s* are level 3 walls in the level 2 group). Motions: src/mjlab_microban/motion/<motion>, made by scripts/make_multi_board_motions.py.",
   "spacing": 1.2,
   "boards": [
     {"level": 1, "seed": 0, "motion": "l1s0.npz"},
@@ -11,6 +11,11 @@
     {"level": 2, "seed": 48},
     {"level": 2, "seed": 53},
     {"level": 2, "seed": 71},
-    {"level": 2, "seed": 74}
+    {"level": 2, "seed": 74},
+    {"wall": "gen_l3_s0", "difficulty": 2},
+    {"wall": "gen_l3_s1", "difficulty": 2},
+    {"level": 2, "seed": 130},
+    {"level": 2, "seed": 87},
+    {"level": 2, "seed": 136}
   ]
 }
