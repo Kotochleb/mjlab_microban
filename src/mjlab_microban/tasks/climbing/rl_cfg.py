@@ -6,7 +6,10 @@
 
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-"""Microban climbing RL configuration (copied from tasks/tracking/rl_cfg.py)"""
+"""Microban climbing RL configuration (copied from tasks/tracking/rl_cfg.py), for residual actions.
+
+Experiment names keep a ``_residual`` suffix, so the log directories stay apart from the earlier absolute-action
+runs (logs/rsl_rl/mjlab_microban_climbing)."""
 
 from copy import deepcopy
 
@@ -22,9 +25,11 @@ MicrobanClimbingRlCfg = RslRlOnPolicyRunnerCfg(
         hidden_dims=(512, 256, 128),
         activation="elu",
         obs_normalization=True,
+        # The residual action scale is 0.25 * effort_limit / stiffness (~0.47 rad at kp 120); an initial std
+        # of 0.5 gives ~0.25 rad of exploration noise around the reference instead of swamping it.
         distribution_cfg={
             "class_name": "GaussianDistribution",
-            "init_std": 1.0,
+            "init_std": 0.5,
             "std_type": "scalar",
         },
     ),
@@ -48,17 +53,11 @@ MicrobanClimbingRlCfg = RslRlOnPolicyRunnerCfg(
         max_grad_norm=1.0,
     ),
     wandb_project="mjlab_microban_climbing",
-    experiment_name="mjlab_microban_climbing",
+    experiment_name="mjlab_microban_climbing_residual",
     save_interval=500,
     num_steps_per_env=24,
     max_iterations=30_000,
 )
-
-# Residual variant: the action scale is 0.25 * effort_limit / stiffness (~0.47 rad at kp 120); an
-# initial std of 0.5 gives ~0.25 rad of exploration noise around the reference instead of swamping it.
-MicrobanClimbingResidualRlCfg = deepcopy(MicrobanClimbingRlCfg)
-MicrobanClimbingResidualRlCfg.actor.distribution_cfg["init_std"] = 0.5
-MicrobanClimbingResidualRlCfg.experiment_name = "mjlab_microban_climbing_residual"
 
 # Conv1d variant (microban_climbing_conv1d_env_cfg.py): the dense 1 s future windows (actor_future /
 # critic_future groups, [B, 50 * C]) go through a Conv1d encoder (future_conv_model.py) before the MLP head.
@@ -83,10 +82,7 @@ def _with_future_conv1d(base: RslRlOnPolicyRunnerCfg, experiment_name: str) -> R
     return cfg
 
 
-MicrobanClimbingConv1dRlCfg = _with_future_conv1d(MicrobanClimbingRlCfg, "mjlab_microban_climbing_conv1d")
-MicrobanClimbingResidualConv1dRlCfg = _with_future_conv1d(
-    MicrobanClimbingResidualRlCfg, "mjlab_microban_climbing_residual_conv1d"
-)
+MicrobanClimbingConv1dRlCfg = _with_future_conv1d(MicrobanClimbingRlCfg, "mjlab_microban_climbing_residual_conv1d")
 
 # Conv1d + history variant (microban_climbing_conv1d_history_env_cfg.py): as the Conv1d variant, and the actor's
 # proprioception is a 0.5 s history ([B, 25, C]) with its own Conv1d encoder (temporal_conv_model.py); its newest
@@ -119,8 +115,5 @@ def _with_history_conv1d(base: RslRlOnPolicyRunnerCfg, experiment_name: str) -> 
 
 
 MicrobanClimbingConv1dHistoryRlCfg = _with_history_conv1d(
-    MicrobanClimbingRlCfg, "mjlab_microban_climbing_conv1d_history"
-)
-MicrobanClimbingResidualConv1dHistoryRlCfg = _with_history_conv1d(
-    MicrobanClimbingResidualRlCfg, "mjlab_microban_climbing_residual_conv1d_history"
+    MicrobanClimbingRlCfg, "mjlab_microban_climbing_residual_conv1d_history"
 )

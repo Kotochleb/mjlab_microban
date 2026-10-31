@@ -9,7 +9,7 @@ http://www.apache.org/licenses/LICENSE-2.0
 -->
 
 <!-- Microban v2 (Radxa): Onshape export converted by onshape-to-robot 1.8.3, climbing forearms (ball hands) and feet; every joint's zero = its motor's zero -->
-<!-- Sixteen collision primitives: trunk and head boxes, two arm servo boxes, two forearm boxes, two thigh boxes, four hook spheres, two foot-ball top boxes, and two sole boxes. -->
+<!-- Eighteen collision primitives: trunk and head boxes, two arm servo boxes, two forearm boxes, two thigh boxes, four hook spheres, two foot-ball top capsules, two hand capsules, and two sole boxes. -->
 <mujoco model="microban">
   <compiler angle="radian" meshdir="assets" />
   <default>
@@ -136,6 +136,8 @@ http://www.apache.org/licenses/LICENSE-2.0
             <!-- Box from the elbow joint to the full 9 mm-radius hand sphere of the velocity model. -->
             <geom name="right_forearm_box_coll" class="collision" type="box" size="0.009 0.03575 0.01125" pos="0 -0.03575 0.01125" contype="1" conaffinity="2" mass="0" rgba="0.3 0.45 0.95 1" />
             <geom name="right_hand_ball_coll" type="sphere" size="0.0125" pos="0.03 -0.0715 0.0135" contype="3" conaffinity="2" group="3" density="0" rgba="0.1 0.85 0.85 1" />
+            <!-- 12 mm diameter x 33 mm long capsule along the hand_ball site X axis, its axis 7.5 mm along site +Z from the hand ball sphere centre, centre shifted 12 mm along site -X. -->
+            <geom name="right_hand_capsule_coll" type="capsule" size="0.006 0.0105" pos="0.018 -0.079 0.0135" quat="0.707107 0 0.707107 0" contype="3" conaffinity="2" group="3" density="0" rgba="0.1 0.85 0.85 1" />
             <site name="right_hand_ball" pos="0.03 -0.0715 0.0135" quat="0.707107 0.707107 0 0" group="3" />
           </body>
         </body>
@@ -182,8 +184,8 @@ http://www.apache.org/licenses/LICENSE-2.0
                   <!-- Encloses all six sole boxes from microban/robot_hulls.xml: 45 x 90 x 2.5 mm, bottom at local y = -0.023. -->
                   <geom name="right_foot_sole_coll" class="collision" type="box" size="0.0225 0.045 0.00125" pos="0 -0.02175 0.042" quat="0 0 0.707107 0.707107" contype="3" conaffinity="2" mass="0" rgba="0.3 0.45 0.95 1" />
                   <geom name="right_foot_ball_coll" type="sphere" size="0.0125" pos="0 -0.0065 0.1095" contype="3" conaffinity="2" group="3" density="0" rgba="0.1 0.85 0.85 1" />
-                  <!-- 12 x 12 x 20 mm box above the foot ball sphere (bottom 3 mm above the sphere top), parallel to the ground, front end 5 mm ahead of the sphere centre in +x, extending toward -x. -->
-                  <geom name="right_foot_ball_box_coll" type="box" size="0.006 0.006 0.01" pos="0 0.015 0.1045" contype="3" conaffinity="2" group="3" density="0" rgba="0.1 0.85 0.85 1" />
+                  <!-- 12 mm diameter x 23 mm long capsule above the foot ball sphere (bottom 3 mm above the sphere top), parallel to the ground, front end 5.5 mm ahead of the sphere centre in +x, extending toward -x. -->
+                  <geom name="right_foot_ball_capsule_coll" type="capsule" size="0.006 0.0055" pos="0 0.015 0.1035" contype="3" conaffinity="2" group="3" density="0" rgba="0.1 0.85 0.85 1" />
                   <site name="right_foot" pos="0 -0.023 0.042" quat="0.5 -0.5 -0.5 -0.5" group="3" />
                   <site name="right_foot_ball" pos="0 -0.0065 0.1095" quat="0.5 -0.5 -0.5 -0.5" group="3" />
                 </body>
@@ -213,6 +215,8 @@ http://www.apache.org/licenses/LICENSE-2.0
             <!-- Box from the elbow joint to the full 9 mm-radius hand sphere of the velocity model. -->
             <geom name="left_forearm_box_coll" class="collision" type="box" size="0.009 0.03575 0.01125" pos="0 0.03575 -0.01125" contype="1" conaffinity="2" mass="0" rgba="0.3 0.45 0.95 1" />
             <geom name="left_hand_ball_coll" type="sphere" size="0.0125" pos="-0.03 0.0715 -0.0135" contype="3" conaffinity="2" group="3" density="0" rgba="0.1 0.85 0.85 1" />
+            <!-- 12 mm diameter x 33 mm long capsule along the hand_ball site X axis, its axis 7.5 mm along site +Z from the hand ball sphere centre, centre shifted 12 mm along site -X. -->
+            <geom name="left_hand_capsule_coll" type="capsule" size="0.006 0.0105" pos="-0.018 0.079 -0.0135" quat="0.707107 0 0.707107 0" contype="3" conaffinity="2" group="3" density="0" rgba="0.1 0.85 0.85 1" />
             <site name="left_hand_ball" pos="-0.03 0.0715 -0.0135" quat="0 0 -0.707107 -0.707107" group="3" />
           </body>
         </body>
@@ -259,8 +263,8 @@ http://www.apache.org/licenses/LICENSE-2.0
                   <!-- Encloses all six sole boxes from microban/robot_hulls.xml: 45 x 90 x 2.5 mm, bottom at local y = -0.023. -->
                   <geom name="left_foot_sole_coll" class="collision" type="box" size="0.0225 0.045 0.00125" pos="0 -0.02175 0.042" quat="0 0 0.707107 0.707107" contype="3" conaffinity="2" mass="0" rgba="0.3 0.45 0.95 1" />
                   <geom name="left_foot_ball_coll" type="sphere" size="0.0125" pos="0 -0.0065 0.1095" contype="3" conaffinity="2" group="3" density="0" rgba="0.1 0.85 0.85 1" />
-                  <!-- 12 x 12 x 20 mm box above the foot ball sphere (bottom 3 mm above the sphere top), parallel to the ground, front end 5 mm ahead of the sphere centre in +x, extending toward -x. -->
-                  <geom name="left_foot_ball_box_coll" type="box" size="0.006 0.006 0.01" pos="0 0.015 0.1045" contype="3" conaffinity="2" group="3" density="0" rgba="0.1 0.85 0.85 1" />
+                  <!-- 12 mm diameter x 23 mm long capsule above the foot ball sphere (bottom 3 mm above the sphere top), parallel to the ground, front end 5.5 mm ahead of the sphere centre in +x, extending toward -x. -->
+                  <geom name="left_foot_ball_capsule_coll" type="capsule" size="0.006 0.0055" pos="0 0.015 0.1035" contype="3" conaffinity="2" group="3" density="0" rgba="0.1 0.85 0.85 1" />
                   <site name="left_foot" pos="0 -0.023 0.042" quat="0.5 -0.5 -0.5 -0.5" group="3" />
                   <site name="left_foot_ball" pos="0 -0.0065 0.1095" quat="0.5 -0.5 -0.5 -0.5" group="3" />
                 </body>

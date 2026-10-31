@@ -37,7 +37,7 @@ def future_conv_num_frames(cfg: ManagerBasedRlEnvCfg) -> int:
 
 
 def make_microban_climbing_conv1d_env_cfg(play: bool = False, **kwargs) -> ManagerBasedRlEnvCfg:
-    """kwargs: forwarded to make_microban_climbing_env_cfg (has_state_estimation, residual, wall, motion_file)."""
+    """kwargs: forwarded to make_microban_climbing_env_cfg (wall, motion_file)."""
     cfg = make_microban_climbing_env_cfg(play=play, **kwargs)
     num_frames = future_conv_num_frames(cfg)
     assert num_frames == FUTURE_CONV_FRAMES, (num_frames, FUTURE_CONV_FRAMES)

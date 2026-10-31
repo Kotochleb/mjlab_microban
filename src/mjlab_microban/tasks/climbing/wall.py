@@ -58,8 +58,8 @@ HOLD_FRICTION = 0.5  # climbing_sim.scene.build_spec's default
 #   WORLD    every robot collision geom (contype bit 0, robot_climb.xml) <-> the floor, the board, the 1-box
 #            blocks and the lips (fronts) of the 5-box cups
 #   SELF     robot <-> robot (robot_climb.xml: conaffinity 2), not used by the wall
-#   HANDLES  the four hand / foot balls (contype |= HANDLES, see the climbing env) <-> all five boxes of the
-#            5-box cups
+#   HANDLES  the four hand / foot balls and the two hand capsules (contype |= HANDLES, see the climbing env)
+#            <-> all five boxes of the 5-box cups
 # So the body boxes never reach the inside of a cup (ledge, back, sides), and the narrowphase only sees
 # the pairs that matter.
 #

@@ -14,7 +14,9 @@ Collision geoms are named "trunk_box_coll", "head_box_coll", "*_servo_coll", "<s
 For alternate models with numbered pieces, labels and highlighting group the pieces of each part.
 
 GUI:
-  - Display: toggle visual meshes / collision geoms / labels, collision opacity
+  - Display: toggle visual meshes / collision geoms / labels / joint frames, collision opacity
+    (joint frames: a small x=red, y=green, z=blue triad at each joint anchor, in the joint's body frame;
+    the four ball-site frames at the hand/foot sphere centres are always shown)
   - Highlight: pick a part (or a whole segment) to show in red
   - Joints: move every joint; the self-contacts of the current pose are listed below
   - Collision geoms: table of every geom with contype/conaffinity/condim
@@ -42,11 +44,17 @@ from mjlab.entity import Entity
 from mjviser.conversions import create_primitive_mesh, mujoco_mesh_to_trimesh
 
 from mjlab_microban.robot import microban_climb_constants
-from mjlab_microban.robot.microban_climb_constants import CLIMB_START_FRAME, MICROBAN_CLIMB_ROBOT_CFG
+from mjlab_microban.robot.microban_climb_constants import (
+    BALL_SITE_NAMES,
+    CLIMB_START_FRAME,
+    MICROBAN_CLIMB_ROBOT_CFG,
+)
 
 VISUAL_GROUP = 2
 HIGHLIGHT_RGB = np.array([235, 50, 50], dtype=np.uint8)
 NONE = "(none)"
+JOINT_FRAME_LENGTH = 0.04  # m, axis length of the per-joint coordinate frames
+BALL_FRAME_LENGTH = 0.025  # m, axis length of the always-on ball-site frames
 
 
 def parse_args() -> argparse.Namespace:
@@ -210,6 +218,42 @@ def main() -> None:
     for part, ids in parts.items():
         label_handles[part] = server.scene.add_label(f"/labels/{part}", part, position=part_centre(ids))
 
+    # A small RGB (x/y/z) frame at each hinge/slide joint anchor, oriented like the joint's body frame
+    # (the frame in which the MJCF joint axis is expressed).
+    joint_ids = [
+        j for j in range(model.njnt) if model.jnt_type[j] in (mujoco.mjtJoint.mjJNT_HINGE, mujoco.mjtJoint.mjJNT_SLIDE)
+    ]
+    joint_frame_handles: dict[int, viser.FrameHandle] = {}
+
+    def joint_pose(j: int) -> tuple[np.ndarray, np.ndarray]:
+        return data.xanchor[j].copy(), data.xquat[model.jnt_bodyid[j]].copy()
+
+    for j in joint_ids:
+        pos, wxyz = joint_pose(j)
+        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, j) or f"joint{j}"
+        joint_frame_handles[j] = server.scene.add_frame(
+            f"/joint_frames/{name}", position=pos, wxyz=wxyz, axes_length=JOINT_FRAME_LENGTH,
+            axes_radius=JOINT_FRAME_LENGTH / 20,
+        )
+
+    # Always-on frames at the ball sites (sphere centres, with the site orientation).
+    ball_site_ids = [
+        s for s in (mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, n) for n in BALL_SITE_NAMES) if s >= 0
+    ]
+    ball_frame_handles: dict[int, viser.FrameHandle] = {}
+
+    def site_pose(s: int) -> tuple[np.ndarray, np.ndarray]:
+        wxyz = np.zeros(4)
+        mujoco.mju_mat2Quat(wxyz, data.site_xmat[s])
+        return data.site_xpos[s].copy(), wxyz
+
+    for s in ball_site_ids:
+        pos, wxyz = site_pose(s)
+        ball_frame_handles[s] = server.scene.add_frame(
+            f"/ball_frames/{mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_SITE, s)}", position=pos, wxyz=wxyz,
+            axes_length=BALL_FRAME_LENGTH, axes_radius=BALL_FRAME_LENGTH / 20,
+        )
+
     print(f"{len(collision_ids)} collision geoms in {len(parts)} parts:")
     for part, ids in parts.items():
         print(f"  {part:42s} {len(ids):3d} geom(s)")
@@ -219,6 +263,13 @@ def main() -> None:
         show_visual = server.gui.add_checkbox("Visual meshes", initial_value=True)
         show_collision = server.gui.add_checkbox("Collision geoms", initial_value=True)
         show_labels = server.gui.add_checkbox("Part labels", initial_value=False)
+        show_joint_frames = server.gui.add_checkbox("Joint frames", initial_value=True)
+
+        @show_joint_frames.on_update
+        def _(_) -> None:
+            for handle in joint_frame_handles.values():
+                handle.visible = show_joint_frames.value
+
         opacity = server.gui.add_slider("Collision opacity", min=0.05, max=1.0, step=0.05, initial_value=0.55)
         if ref_handles:
             show_ref = server.gui.add_checkbox(f"Compare: {args.compare.name} (red)", initial_value=True)
@@ -302,6 +353,10 @@ def main() -> None:
             handle.position, handle.wxyz = geom_pose(data, i)
         for part, handle in label_handles.items():
             handle.position = part_centre(parts[part])
+        for j, handle in joint_frame_handles.items():
+            handle.position, handle.wxyz = joint_pose(j)
+        for s, handle in ball_frame_handles.items():
+            handle.position, handle.wxyz = site_pose(s)
         if ref_handles:
             ref_data.qpos[:] = data.qpos
             mujoco.mj_forward(ref_model, ref_data)

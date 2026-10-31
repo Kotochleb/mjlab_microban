@@ -31,6 +31,9 @@ assert MICROBAN_CLIMB_XML.exists(), f"XML not found: {MICROBAN_CLIMB_XML}"
 # Ball collision geoms (named in the MJCF), and the bodies carrying them.
 BALL_GEOM_NAMES = ("left_hand_ball_coll", "right_hand_ball_coll", "left_foot_ball_coll", "right_foot_ball_coll")
 BALL_SITE_NAMES = ("left_hand_ball", "right_hand_ball", "left_foot_ball", "right_foot_ball")
+# Capsules on the hand balls; like the balls, they can reach the inside of the 5-box cups (handles group).
+HAND_CAPSULE_GEOM_NAMES = ("left_hand_capsule_coll", "right_hand_capsule_coll")
+HANDLE_GEOM_NAMES = BALL_GEOM_NAMES + HAND_CAPSULE_GEOM_NAMES
 HANDS_BODY_NAMES = ("radius_left", "radius_right")
 FEET_BODY_NAMES = ("foot_climb_2", "foot_climb")  # left, right
 

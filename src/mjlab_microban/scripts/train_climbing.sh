@@ -12,10 +12,9 @@
 # Usage:
 #   src/mjlab_microban/scripts/train_climbing.sh [variant flags] [motion.npz|planner.npz] [extra train args...]
 #
-# Variant flags (anywhere on the line; they build the task id Mjlab-Climbing-Microban[-Residual]
-# [-No-State-Estimation][-Conv1d|-Conv1d-History]):
-#   --residual              residual actions: the policy outputs corrections on the reference joint positions
-#   --no-state-estimation   the No-State-Estimation variant (mlp policy only)
+# All climbing tasks use residual actions (target = ref + 0.25 * effort_limit / kp * a) and no state estimation.
+#
+# Variant flags (anywhere on the line; they pick the task id Mjlab-Climbing-Microban[-Conv1d|-Conv1d-History]):
 #   --policy P              the policy's view of the reference / proprioception (default: mlp, or $POLICY):
 #       mlp             flat inputs of the MLP (future reference frames, 5-step proprioceptive history);
 #       conv1d          dense 1 s windows of the future reference, encoded by 1D convolutions before the MLP
@@ -35,7 +34,7 @@
 # A planner output (rock-climbing-workshop/scripts/plan_sim_wall.py --save-npz, with q: N x 26) is first
 # converted to a motion with workshop_to_npz.py: <name>_q.npz -> <name>.npz, other names -> <name>_motion.npz.
 # Environment variables:
-#   TASK       Task id, used as is instead of the variant flags (--residual / --no-state-estimation / --policy)
+#   TASK       Task id, used as is instead of --policy
 #   NUM_ENVS   Default of --num-envs (4096)
 #   VIDEO      Record training videos (default: True)
 #   POLICY     Default of --policy (mlp)
@@ -43,9 +42,8 @@
 # Examples:
 #   src/mjlab_microban/scripts/train_climbing.sh
 #   src/mjlab_microban/scripts/train_climbing.sh src/mjlab_microban/motion/l1s0_q.npz --agent.max-iterations 10000
-#   src/mjlab_microban/scripts/train_climbing.sh --residual
-#   src/mjlab_microban/scripts/train_climbing.sh --residual --conv1d-history src/mjlab_microban/motion/l1s0.npz
-#   src/mjlab_microban/scripts/train_climbing.sh --no-state-estimation --num-envs 2048 --no-video
+#   src/mjlab_microban/scripts/train_climbing.sh --conv1d-history src/mjlab_microban/motion/l1s0.npz
+#   src/mjlab_microban/scripts/train_climbing.sh --conv1d --num-envs 2048 --no-video
 
 set -euo pipefail
 
@@ -54,9 +52,8 @@ usage() { sed -n '/^# Usage:/,/^# Examples:/p' "$0" | sed 's/^# \{0,1\}//' | sed
 NUM_ENVS="${NUM_ENVS:-4096}"
 VIDEO="${VIDEO:-True}"
 POLICY="${POLICY:-mlp}"
-RESIDUAL=false
-NO_STATE_ESTIMATION=false
 DRY_RUN=false
+POLICY_FLAG=false  # --policy given explicitly
 
 need_value() { [[ $2 -ge 2 ]] || { echo "$1 needs a value" >&2; exit 1; }; }
 
@@ -65,12 +62,10 @@ ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h|--help) usage; exit 0 ;;
-    --residual) RESIDUAL=true; shift ;;
-    --no-state-estimation) NO_STATE_ESTIMATION=true; shift ;;
-    --policy) need_value "$1" $#; POLICY="$2"; shift 2 ;;
-    --policy=*) POLICY="${1#--policy=}"; shift ;;
-    --conv1d) POLICY=conv1d; shift ;;
-    --conv1d-history) POLICY=conv1d-history; shift ;;
+    --policy) need_value "$1" $#; POLICY="$2"; POLICY_FLAG=true; shift 2 ;;
+    --policy=*) POLICY="${1#--policy=}"; POLICY_FLAG=true; shift ;;
+    --conv1d) POLICY=conv1d; POLICY_FLAG=true; shift ;;
+    --conv1d-history) POLICY=conv1d-history; POLICY_FLAG=true; shift ;;
     --num-envs) need_value "$1" $#; NUM_ENVS="$2"; shift 2 ;;
     --num-envs=*) NUM_ENVS="${1#--num-envs=}"; shift ;;
     --no-video) VIDEO=False; shift ;;
@@ -90,19 +85,12 @@ case "$POLICY" in
 esac
 
 if [[ -n "${TASK:-}" ]]; then
-  if $RESIDUAL || $NO_STATE_ESTIMATION || [[ -n "$POLICY_SUFFIX" ]]; then
-    echo "TASK=$TASK is set: drop it or the variant flags (--residual / --no-state-estimation / --policy)" >&2
+  if $POLICY_FLAG; then
+    echo "TASK=$TASK is set: drop it or --policy" >&2
     exit 1
   fi
 else
-  if $NO_STATE_ESTIMATION && [[ -n "$POLICY_SUFFIX" ]]; then
-    echo "--no-state-estimation has no $POLICY variant (mlp policy only)" >&2
-    exit 1
-  fi
-  TASK="Mjlab-Climbing-Microban"
-  $RESIDUAL && TASK+="-Residual"
-  $NO_STATE_ESTIMATION && TASK+="-No-State-Estimation"
-  TASK+="$POLICY_SUFFIX"
+  TASK="Mjlab-Climbing-Microban$POLICY_SUFFIX"
 fi
 
 export MUJOCO_GL=egl

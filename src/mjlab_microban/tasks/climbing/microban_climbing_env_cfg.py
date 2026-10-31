@@ -13,6 +13,9 @@ climbing_sim, generated as rock-climbing-workshop/scripts/plan_sim_wall.py does)
 holds, and tracks a planned climb of that wall (BeyondMimic-style, as the tracking task). The motion is made
 from plan_sim_wall.py's --save-npz output by scripts/workshop_to_npz.py, for the same wall.
 
+Actions are residuals on the reference: the policy outputs corrections on the joint positions of the planned
+climb. The actor observes proprioception only (no state estimation: no base linear velocity or global pose).
+
 Rewards: DeepMimic's imitation reward (pose, velocity, end effectors = balls, root position) with
 BeyondMimic's regularisers and a penalty on the residual's magnitude. The RL config is a copy of
 tasks/tracking/rl_cfg.py.
@@ -30,7 +33,7 @@ from mjlab.envs.mdp import dr
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers.curriculum_manager import CurriculumTermCfg
 from mjlab.managers.event_manager import EventTermCfg
-from mjlab.managers.observation_manager import ObservationGroupCfg, ObservationTermCfg
+from mjlab.managers.observation_manager import ObservationTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.termination_manager import TerminationTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
@@ -44,6 +47,7 @@ from mjlab_microban.robot.microban_climb_constants import (
     BALL_GEOM_NAMES,
     BALL_SITE_NAMES,
     FEET_BODY_NAMES,
+    HANDLE_GEOM_NAMES,
     HANDS_BODY_NAMES,
     MICROBAN_CLIMB_ROBOT_CFG,
 )
@@ -74,7 +78,7 @@ CRITIC_FUTURE_OFFSETS = (1, 2, 3, 4, 6, 8, 10, 14, 18)
 # A ball is expected on a hold where its reference position is this close to a hold point.
 EXPECTED_CONTACT_THRESHOLD = 0.003
 
-# Residual variant: action scale on top of the reference joint positions, as in BeyondMimic:
+# Residual action scale on top of the reference joint positions, as in BeyondMimic:
 # 0.25 * effort_limit / stiffness, at the P gain (0.47 rad at kp 120).
 RESIDUAL_STIFFNESS_SCALE = 0.25
 
@@ -118,11 +122,13 @@ def _robot_spec_fn(get_spec, trunk_pos):
         spec.body("trunk").pos = trunk_pos
         spec.body("trunk").quat = (1.0, 0.0, 0.0, 0.0)
         # Collision groups (wall.py, COLLISION_WORLD): every robot collision geom is in the world group, the
-        # four balls also in the handles group (the inside of the 5-box cups).
+        # four balls and the two hand capsules also in the handles group (the inside of the 5-box cups).
+        missing = set(HANDLE_GEOM_NAMES) - {geom.name for geom in spec.geoms}
+        assert not missing, f"handle geoms missing from the robot MJCF: {sorted(missing)}"
         for geom in spec.geoms:
             if geom.contype or geom.conaffinity:
                 assert geom.contype & COLLISION_WORLD, f"robot geom {geom.name!r} not in the world collision group"
-            if geom.name in BALL_GEOM_NAMES:
+            if geom.name in HANDLE_GEOM_NAMES:
                 geom.contype |= COLLISION_HANDLES
         return spec
 
@@ -134,9 +140,7 @@ TRACKED_BODY_NAMES = ("trunk",) + END_EFFECTOR_BODY_NAMES + ("head",)
 
 
 def make_microban_climbing_env_cfg(
-    has_state_estimation: bool = True,
     play: bool = False,
-    residual: bool = False,
     wall: WallSpec | None = None,
     motion_file: str | None = None,
 ) -> ManagerBasedRlEnvCfg:
@@ -209,17 +213,14 @@ def make_microban_climbing_env_cfg(
     #---------------------------- Actions ---------------------------
     joint_pos_action = cfg.actions["joint_pos"]
     assert isinstance(joint_pos_action, JointPositionActionCfg)
-    if residual:
-        # The policy outputs corrections on the reference joint positions (of the frame the step ends
-        # on); a small scale so that the untrained policy roughly plays back the reference.
-        cfg.actions["joint_pos"] = mdp.ResidualJointPositionActionCfg(
-            entity_name=joint_pos_action.entity_name,
-            actuator_names=joint_pos_action.actuator_names,
-            stiffness_scale=RESIDUAL_STIFFNESS_SCALE,
-            command_name="motion",
-        )
-    else:
-        joint_pos_action.scale = 1.0
+    # The policy outputs corrections on the reference joint positions (of the frame the step ends on); a small
+    # scale so that the untrained policy roughly plays back the reference.
+    cfg.actions["joint_pos"] = mdp.ResidualJointPositionActionCfg(
+        entity_name=joint_pos_action.entity_name,
+        actuator_names=joint_pos_action.actuator_names,
+        stiffness_scale=RESIDUAL_STIFFNESS_SCALE,
+        command_name="motion",
+    )
 
     #---------------------------- Commands --------------------------
     motion_cmd = cfg.commands["motion"]
@@ -441,19 +442,6 @@ def make_microban_climbing_env_cfg(
     cfg.viewer.azimuth = 0.0  # looking along +x, towards the wall
     cfg.viewer.elevation = -20.0  # from above: the camera is ~0.5 m above the trunk
     cfg.viewer.distance = 1.38 / math.cos(math.radians(-cfg.viewer.elevation))
-
-    #---------------------------- State estimation ------------------
-    # The actor no longer observes motion_anchor_pos_b / base_lin_vel, so this is a no-op for it now.
-    if not has_state_estimation:
-        cfg.observations["actor"] = ObservationGroupCfg(
-            terms={
-                k: v
-                for k, v in cfg.observations["actor"].terms.items()
-                if k not in ["motion_anchor_pos_b", "base_lin_vel"]
-            },
-            concatenate_terms=True,
-            enable_corruption=True,
-        )
 
     #---------------------------- Play mode -------------------------
     if play:
