@@ -13,10 +13,14 @@ import warp as wp
 from bam.mjlab import BamActuator
 from mjlab.entity import Entity
 from mjlab.envs.mdp.actions import JointPositionAction, JointPositionActionCfg
+from mjlab.managers.event_manager import requires_model_fields
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import ContactSensor, TerrainHeightSensor
 from mjlab.tasks.tracking.mdp import MotionCommand
 from mjlab.utils.lab_api.math import matrix_from_quat, quat_apply, quat_error_magnitude, quat_inv, quat_mul
+
+from mjlab_microban.tasks.climbing import hold_boxes
+from mjlab_microban.tasks.climbing.wall import SIM_TO_ENV_ROT
 
 if TYPE_CHECKING:
     from mjlab.envs import ManagerBasedRlEnv
@@ -660,6 +664,42 @@ class geom_pos_dr_curriculum:
         return {"progress": alpha, "max_offset_mm": offset * 1e3}
 
 
+@requires_model_fields("geom_size", "geom_pos", "geom_rbound", "geom_aabb")
+def shorten_box_geom(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor | None,
+    asset_cfg: SceneEntityCfg,
+    max_shortening: float,
+    axis: int = 1,
+    side: float = 1.0,
+) -> None:
+    """Shorten box geoms by s ~ U(0, ``max_shortening``) [m] (per env and geom) along their local ``axis``, cutting
+    the ``side`` (+1 / -1) end: the opposite end stays in place, so the center moves by s / 2 towards it."""
+    asset: Entity = env.scene[asset_cfg.name]
+    geom_ids = asset.indexing.geom_ids[asset_cfg.geom_ids]
+    if env_ids is None:
+        env_ids = torch.arange(env.num_envs, device=env.device)
+    env_ids = env_ids.to(env.device, dtype=torch.long)
+    def_size = env.sim.get_default_field("geom_size")[geom_ids]  # [G, 3]
+    def_pos = env.sim.get_default_field("geom_pos")[geom_ids]  # [G, 3]
+    def_quat = env.sim.get_default_field("geom_quat")[geom_ids]  # [G, 4]
+    unit = torch.zeros_like(def_pos)
+    unit[:, axis] = side
+    cut_dir = quat_apply(def_quat, unit)  # [G, 3]: the cut end's direction, in the body frame
+
+    s = torch.rand(len(env_ids), len(geom_ids), device=env.device) * max_shortening  # [E, G]
+    size = def_size.expand(len(env_ids), -1, -1).clone()
+    size[..., axis] -= 0.5 * s
+    pos = def_pos - 0.5 * s[..., None] * cut_dir
+
+    env_grid, geom_grid = torch.meshgrid(env_ids, geom_ids.to(env_ids.dtype), indexing="ij")
+    env.sim.model.geom_size[env_grid, geom_grid] = size
+    env.sim.model.geom_pos[env_grid, geom_grid] = pos
+    # Broadphase bounds of a box: half sizes (aabb, centered) and their norm (rbound).
+    env.sim.model.geom_aabb[env_grid, geom_grid, 1] = size
+    env.sim.model.geom_rbound[env_grid, geom_grid] = size.norm(dim=-1)
+
+
 def bam_torque_utilisation(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG) -> torch.Tensor:
     """Fraction of the currently available motor torque used by each BAM actuator, in [0, 1], shape [B, J].
 
@@ -850,6 +890,165 @@ def contact_count(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tensor:
     sensor: ContactSensor = env.scene[sensor_name]
     assert sensor.data.found is not None
     return (sensor.data.found > 0).float().sum(dim=-1)
+
+
+class hold_bottom_contact:
+    """Number of the sensor's primaries (balls / capsules) touching the bottom of a hold, from below.
+
+    Penalised, per contact: the hold is above the geom, n_z > cos_threshold (hold frame, hold_boxes.py: x along
+    the wall, y into the wall, z up; ``normal`` points from the robot geom to the hold). Every other contact (top,
+    inside of a cup, sides, front) is allowed. Only contacts within ``margin`` of the extents of the nearest
+    hold (the contact point relative to its socket) count, e.g. not the board.
+
+    The sensor: primaries the robot geoms, secondary the wall subtree, fields ("pos", "normal"), any reduce;
+    num_slots > 1 so that a capsule touching a hold at several places is seen. A slot with no contact has a
+    zero normal. Hold sockets are the wall's ``hold<k>_socket`` sites, read in the world frame (as the contact
+    points), so this works for the single- and multi-board walls alike.
+    """
+
+    def __init__(self, cfg, env: ManagerBasedRlEnv):
+        wall: Entity = env.scene[cfg.params.get("wall_name", "wall")]
+        self.socket_ids, names = wall.find_sites(r".*hold\d+_socket")
+        assert names, "no hold<k>_socket sites on the wall"
+        self.rot = torch.tensor(SIM_TO_ENV_ROT, dtype=torch.float32, device=env.device)  # hold frame -> env frame
+        m = cfg.params.get("margin", 0.003)
+        top = max(hold_boxes.LIP_TOP_Z, hold_boxes.BACK_TOP_Z)
+        self.lo = torch.tensor(
+            [-hold_boxes.HOLD_HALF_WIDTH - m, hold_boxes.HOLD_FRONT_Y - m, hold_boxes.HOLD_BOTTOM_Z - m],
+            device=env.device,
+        )
+        self.hi = torch.tensor([hold_boxes.HOLD_HALF_WIDTH + m, hold_boxes.HOLD_BACK_Y + m, top + m], device=env.device)
+
+    def __call__(
+        self,
+        env: ManagerBasedRlEnv,
+        sensor_name: str,
+        num_slots: int,
+        cos_threshold: float = 0.7,
+        margin: float = 0.003,
+        wall_name: str = "wall",
+    ) -> torch.Tensor:
+        del margin
+        sensor: ContactSensor = env.scene[sensor_name]
+        assert sensor.data.pos is not None and sensor.data.normal is not None
+        B = env.num_envs
+        pos = sensor.data.pos.view(B, -1, 3)  # [B, N * S, 3], world frame
+        normal = sensor.data.normal.view(B, -1, 3)
+        valid = normal.norm(dim=-1) > 1e-6
+
+        sockets = env.scene[wall_name].data.site_pos_w[:, self.socket_ids]  # [B, H, 3], world frame
+        nearest = torch.cdist(pos, sockets).argmin(dim=-1)  # [B, N * S]
+        socket = torch.gather(sockets, 1, nearest[..., None].expand(-1, -1, 3))
+        rel = (pos - socket) @ self.rot  # env -> hold frame (row vectors)
+        n = normal @ self.rot
+
+        on_hold = ((rel >= self.lo) & (rel <= self.hi)).all(dim=-1)
+        below = valid & on_hold & (n[..., 2] > cos_threshold)  # [B, N * S]
+
+        below = below.view(B, -1, num_slots).any(dim=-1)  # [B, N]
+        env.extras["log"]["Metrics/hold_bottom_contact"] = below.any(-1).float().mean()
+        return below.float().sum(dim=-1)
+
+
+class ball_in_hold_contact:
+    """Number of balls seated in a hold's cup while the reference holds them there.
+
+    A ball counts when, among its contacts with the wall (hold frame, hold_boxes.py: x along the wall, y into the
+    wall, z up; ``normal`` points from the ball to the hold):
+      - it touches the cup's floor (the ledge) from above: n_z < -cos_threshold, contact point at the floor's height
+        (z <= -BALL_RADIUS + margin), or
+      - it touches a cup wall (lip, back, sides) from the inside: mostly horizontal normal (|n_xy| > cos_threshold)
+        pointing away from the socket (an outer face's normal points towards it). The contact point may be anywhere
+        within the hold (a ball pressing on a wall sinks a few mm into it),
+    and none of its contacts is from the top of a wall: n_z < -cos_threshold above the floor (z > -BALL_RADIUS +
+    margin), anywhere on the hold (e.g. the ball resting on the lip's rim, or on a 1-box block) — that ball gets 0.
+
+    It is gated by the reference: only balls expected in contact (mdp.motion_contact_schedule's ``contact``) on
+    every frame from ``window`` policy steps back to ``window`` steps ahead (motion_frames_ahead: speed scaled,
+    clamped to the env's motion / board segment). The schedule is the critic's ``schedule_term`` observation term
+    (built before the rewards), so the single- and multi-board schedules are both used as they are.
+
+    The sensor: primaries BALL_GEOM_NAMES (any order, put back in ``geom_names`` order, which must be the order of
+    the schedule's site_names), secondary the wall subtree, fields ("pos", "normal"), num_slots > 1.
+    """
+
+    def __init__(self, cfg, env: ManagerBasedRlEnv):
+        p = cfg.params
+        wall: Entity = env.scene[p.get("wall_name", "wall")]
+        self.socket_ids, names = wall.find_sites(r".*hold\d+_socket")
+        assert names, "no hold<k>_socket sites on the wall"
+        self.rot = torch.tensor(SIM_TO_ENV_ROT, dtype=torch.float32, device=env.device)  # hold frame -> env frame
+
+        # Sensor slots (model order) -> geom_names order, as in ball_contacts.
+        asset_name = p.get("asset_name", "robot")
+        ids = [env.sim.mj_model.geom(f"{asset_name}/{n}").id for n in p["geom_names"]]
+        model_order = sorted(range(len(ids)), key=lambda i: ids[i])
+        self.perm = torch.tensor([model_order.index(i) for i in range(len(ids))], device=env.device)
+
+        m = p.get("margin", 0.002)
+        hb = hold_boxes
+        # Contacts within ``margin`` of the hold's extents (the contact point relative to the nearest socket) count.
+        self.hold_lo = torch.tensor([-hb.HOLD_HALF_WIDTH - m, hb.HOLD_FRONT_Y - m, hb.HOLD_BOTTOM_Z - m], device=env.device)
+        top = max(hb.LIP_TOP_Z, hb.BACK_TOP_Z)
+        self.hold_hi = torch.tensor([hb.HOLD_HALF_WIDTH + m, hb.HOLD_BACK_Y + m, top + m], device=env.device)
+        self.floor_z = hb.LEDGE.hi[2] + m  # contacts from above at or below it: the floor; above it: a wall's top
+
+        schedule = env.observation_manager.get_term_cfg(*p.get("schedule_term", ("critic", "motion_contact_schedule")))
+        assert isinstance(schedule.func, motion_contact_schedule), "schedule_term is not a motion_contact_schedule"
+        self.expected = schedule.func.contact  # [T, N]
+        w = int(p.get("window", 5))
+        self.offsets = torch.arange(-w, w + 1, device=env.device)  # [2w + 1]
+
+    def __call__(
+        self,
+        env: ManagerBasedRlEnv,
+        sensor_name: str,
+        command_name: str,
+        geom_names: tuple[str, ...],
+        num_slots: int,
+        window: int = 5,
+        cos_threshold: float = 0.7,
+        margin: float = 0.002,
+        schedule_term: tuple[str, str] = ("critic", "motion_contact_schedule"),
+        wall_name: str = "wall",
+        asset_name: str = "robot",
+    ) -> torch.Tensor:
+        del window, margin, schedule_term, asset_name
+        sensor: ContactSensor = env.scene[sensor_name]
+        assert sensor.data.pos is not None and sensor.data.normal is not None
+        B, N = env.num_envs, len(geom_names)
+        pos = sensor.data.pos.view(B, N, num_slots, 3)[:, self.perm].reshape(B, -1, 3)  # world frame, geom_names order
+        normal = sensor.data.normal.view(B, N, num_slots, 3)[:, self.perm].reshape(B, -1, 3)
+        valid = normal.norm(dim=-1) > 1e-6
+
+        sockets = env.scene[wall_name].data.site_pos_w[:, self.socket_ids]  # [B, H, 3]
+        nearest = torch.cdist(pos, sockets).argmin(dim=-1)  # [B, N * S]
+        socket = torch.gather(sockets, 1, nearest[..., None].expand(-1, -1, 3))
+        rel = (pos - socket) @ self.rot  # env -> hold frame
+        n = normal @ self.rot
+
+        on_hold = valid & ((rel >= self.hold_lo) & (rel <= self.hold_hi)).all(dim=-1)
+        from_above = n[..., 2] < -cos_threshold
+        floor = on_hold & from_above & (rel[..., 2] <= self.floor_z)
+        outward = (n[..., :2] * rel[..., :2]).sum(dim=-1) > 0  # normal away from the socket: an inner face
+        wall_inside = on_hold & (n[..., :2].norm(dim=-1) > cos_threshold) & outward
+        wall_top = on_hold & from_above & (rel[..., 2] > self.floor_z)
+
+        def per_ball(x: torch.Tensor) -> torch.Tensor:
+            return x.view(B, N, num_slots).any(dim=-1)  # [B, N]
+
+        seated = (per_ball(floor) | per_ball(wall_inside)) & ~per_ball(wall_top)
+
+        command = cast(MotionCommand, env.command_manager.get_term(command_name))
+        idx = motion_frames_ahead(command, self.offsets)  # [B, 2w + 1]
+        expected = self.expected[idx].all(dim=1)  # [B, N]
+
+        rewarded = seated & expected
+        log = env.extras["log"]
+        log["Metrics/ball_in_hold_expected"] = expected.float().mean()
+        log["Metrics/ball_in_hold_seated_when_expected"] = (rewarded.float().sum() / expected.float().sum().clamp(min=1))
+        log["Metrics/ball_on_hold_top"] = per_ball(wall_top).float().mean()
+        return rewarded.float().sum(dim=-1)
 
 
 def applied_joint_torques(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG) -> torch.Tensor:

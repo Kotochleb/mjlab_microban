@@ -14,6 +14,7 @@
 #   src/mjlab_microban/scripts/train_climbing.sh [variant flags] [motion.npz|planner.npz] [extra train args...]
 #   src/mjlab_microban/scripts/train_climbing.sh --play [variant flags] [play flags] [motion.npz] [extra play args...]
 #   src/mjlab_microban/scripts/train_climbing.sh --replay [variant flags] [motion.npz] [extra play args...]
+#   src/mjlab_microban/scripts/train_climbing.sh --deploy [variant flags] [play flags] [deploy flags] [motion.npz]
 #
 # All climbing tasks use residual actions (target = ref + 0.25 * effort_limit / kp * a) and no state estimation.
 #
@@ -50,6 +51,31 @@
 #                           --run / --wandb-run-path only pick its motion (no checkpoint is loaded); for the open
 #                           loop viewer with a frame slider, see scripts/play_open_loop.py
 #   --video                 also record a clip to <run>/videos/play (play's --video-length, default 200 steps)
+#   --viser                 view in the Viser web viewer (implies --play; http://localhost:8080) instead of the
+#                           native MuJoCo one: its Rewards tab plots each reward term live (bars of the ~1 s mean,
+#                           and their histories), its Metrics tab the env's metrics; the env shown is picked in
+#                           Controls > Scene
+# Deploy flags (the policy --play would play, on the real robot):
+#   --deploy                export the policy --play would play (same --run / --checkpoint / --wandb-run-path and
+#                           motion selection) to a deployment bundle for the robot's 50 Hz loop, checked against the
+#                           env (scripts/export_climbing_deploy.py: the move's observation, actions and targets have
+#                           to match the env's, tick by tick); single-board MLP tasks (the adaptive phase or not)
+#   --deploy-out DIR        the bundle's folder (default: logs/deploy/<run>_<checkpoint>)
+#   --check-steps N         ticks of the parity check (default 500, 10 s; 0: none)
+#                           The robot's side is in rock-climbing-workshop ($RCR_REPO, default ../rock-climbing-workshop):
+#                           src/rcr/controller/mjlab_policy.py runs the policy, src/rcr/robot/climb_policy_move.py is
+#                           its Microban move; the export checks that controller against the env
+#   --sim-check             then run the move closed loop in the organisers' simulator, hanging on the wall's start
+#                           holds (rock-climbing-workshop's scripts/sim_check_climb_policy.py, with its Python,
+#                           $RCR_PYTHON, default <workshop>/.venv/bin/python: uv sync --group sim --group rl there);
+#                           --sim-seconds S of climbing (default 30)
+#   --host H                then copy our Pi code (scripts/link_pi.py deploy H: ~/rcr/src) and the bundle
+#                           (H:~/climb_policy) to the robot, and run the robot's program with the move (Microban's
+#                           make run HOST=H MOVES=src/rcr/robot/climb_policy_move.py, in $MICROBAN, default
+#                           <workshop>/third_party/microban): the robot on the wall, its balls in the
+#                           start holds, rope on. Then, in the dashboard, start "climb_policy": the joints ramp to the
+#                           climb's first pose (2 s), hold it (2 s), and the policy climbs; stop it to end
+#                           (it holds 5 s, then the torque goes off). Its log: H:~/climb_logs/
 #   In play, --num-envs defaults to 1 and the variant flags have to match the run's (--policy, --multi-board /
 #   --boards-file). The wall's motion .npz is selected automatically when not given: the one the run was trained
 #   on (its params/env.yaml, or the W&B run's config), found by its path, else by its file name under
@@ -75,7 +101,10 @@
 #   src/mjlab_microban/scripts/train_climbing.sh --play --conv1d-history
 #   src/mjlab_microban/scripts/train_climbing.sh --replay src/mjlab_microban/motion/multi_board/l2s19.npz
 #   src/mjlab_microban/scripts/train_climbing.sh --play --conv1d --wandb-run-path my-team/mjlab_microban_climbing/abc123xy
+#   src/mjlab_microban/scripts/train_climbing.sh --play --viser --adaptive-phase --wandb-run-path my-team/mjlab_microban_climbing/abc123xy
 #   src/mjlab_microban/scripts/train_climbing.sh --play --checkpoint logs/rsl_rl/mjlab_microban_climbing_residual/<run>/model_5000.pt
+#   src/mjlab_microban/scripts/train_climbing.sh --deploy --adaptive-phase --wandb-run-path my-team/mjlab_microban_climbing/abc123xy --sim-check
+#   src/mjlab_microban/scripts/train_climbing.sh --deploy --adaptive-phase --wandb-run-path my-team/mjlab_microban_climbing/abc123xy --host microban
 
 set -euo pipefail
 
@@ -94,9 +123,16 @@ PLAY=false
 PLAY_RUN=""
 PLAY_CHECKPOINT=""
 PLAY_VIDEO=false
+PLAY_VISER=false
 REPLAY=false
 WANDB_RUN=""
 WANDB_CHECKPOINT=""
+DEPLOY=false
+DEPLOY_OUT=""
+CHECK_STEPS=500
+SIM_CHECK=false
+SIM_SECONDS=30
+ROBOT_HOST=""
 
 need_value() { [[ $2 -ge 2 ]] || { echo "$1 needs a value" >&2; exit 1; }; }
 
@@ -123,17 +159,34 @@ while [[ $# -gt 0 ]]; do
     --checkpoint) need_value "$1" $#; PLAY=true; PLAY_CHECKPOINT="$2"; shift 2 ;;
     --checkpoint=*) PLAY=true; PLAY_CHECKPOINT="${1#--checkpoint=}"; shift ;;
     --video) PLAY_VIDEO=true; shift ;;
+    --viser) PLAY=true; PLAY_VISER=true; shift ;;
     --replay) PLAY=true; REPLAY=true; shift ;;
     --wandb-run-path|--wandb-run) need_value "$1" $#; PLAY=true; WANDB_RUN="$2"; shift 2 ;;
     --wandb-run-path=*|--wandb-run=*) PLAY=true; WANDB_RUN="${1#*=}"; shift ;;
     --wandb-checkpoint-name|--wandb-checkpoint) need_value "$1" $#; PLAY=true; WANDB_CHECKPOINT="$2"; shift 2 ;;
     --wandb-checkpoint-name=*|--wandb-checkpoint=*) PLAY=true; WANDB_CHECKPOINT="${1#*=}"; shift ;;
+    --deploy) PLAY=true; DEPLOY=true; shift ;;
+    --deploy-out) need_value "$1" $#; DEPLOY=true; PLAY=true; DEPLOY_OUT="$2"; shift 2 ;;
+    --deploy-out=*) DEPLOY=true; PLAY=true; DEPLOY_OUT="${1#*=}"; shift ;;
+    --check-steps) need_value "$1" $#; CHECK_STEPS="$2"; shift 2 ;;
+    --check-steps=*) CHECK_STEPS="${1#*=}"; shift ;;
+    --sim-check) DEPLOY=true; PLAY=true; SIM_CHECK=true; shift ;;
+    --sim-seconds) need_value "$1" $#; SIM_SECONDS="$2"; shift 2 ;;
+    --sim-seconds=*) SIM_SECONDS="${1#*=}"; shift ;;
+    --host) need_value "$1" $#; DEPLOY=true; PLAY=true; ROBOT_HOST="$2"; shift 2 ;;
+    --host=*) DEPLOY=true; PLAY=true; ROBOT_HOST="${1#*=}"; shift ;;
     *) ARGS+=("$1"); shift ;;
   esac
 done
 set -- ${ARGS[@]+"${ARGS[@]}"}
 
 $PLAY && ! $NUM_ENVS_SET && NUM_ENVS=1
+if $DEPLOY; then
+  $REPLAY && { echo "--deploy exports a policy: drop --replay" >&2; exit 1; }
+  $MULTI_BOARD && { echo "--deploy takes one board: drop --multi-board (give the board's motion file)" >&2; exit 1; }
+  $PLAY_VIDEO && { echo "--deploy records no video: drop --video" >&2; exit 1; }
+  $PLAY_VISER && { echo "--deploy opens no viewer: drop --viser" >&2; exit 1; }
+fi
 [[ "$NUM_ENVS" =~ ^[1-9][0-9]*$ ]] || { echo "--num-envs must be a positive integer, got $NUM_ENVS" >&2; exit 1; }
 
 case "$POLICY" in
@@ -167,8 +220,12 @@ REPO_ROOT="$(cd "$(dirname "$(realpath "$0")")/../../.." && pwd)"
 
 # The rsl_rl experiment (logs/rsl_rl/<name>) of a task id, as in tasks/climbing/rl_cfg.py and __init__.py.
 experiment_name() {
-  local rest="${1#Mjlab-Climbing-Microban}" name="mjlab_microban_climbing_residual" multi=""
+  local rest="${1#Mjlab-Climbing-Microban}" name="mjlab_microban_climbing_residual" multi="" adaptive=""
   [[ "$rest" != "$1" ]] || return 1
+  if [[ "$rest" == -Adaptive-Phase* ]]; then
+    adaptive="_adaptive_phase"
+    rest="${rest#-Adaptive-Phase}"
+  fi
   if [[ "$rest" == -Multi-Board* ]]; then
     multi="_multi_board"
     rest="${rest#-Multi-Board}"
@@ -179,7 +236,7 @@ experiment_name() {
     -Conv1d-History) name+="_conv1d_history" ;;
     *) return 1 ;;
   esac
-  echo "$name$multi"
+  echo "$name$adaptive$multi"
 }
 
 # The latest model_<iteration>.pt of a run directory (by iteration), or nothing.
@@ -207,6 +264,65 @@ local_motion() {
   found="$(find "$REPO_ROOT/src/mjlab_microban/motion" -type f -name "$(basename "$p")" 2>/dev/null)"
   if [[ -n "$found" && "$(wc -l <<< "$found")" -eq 1 ]]; then
     echo "$found"
+  fi
+}
+
+# The policy play would play, exported for the robot ($CHECKPOINT / $WANDB_RUN, $MOTION_FILE set by play below),
+# then checked in the organisers' simulator (--sim-check) and run on the robot (--host).
+deploy() {
+  [[ $# -eq 0 ]] || { echo "--deploy takes no extra arguments, got: $*" >&2; exit 1; }
+  # The robot's side lives in rock-climbing-workshop: the controller (src/rcr/controller/mjlab_policy.py), its
+  # Microban move (src/rcr/robot/climb_policy_move.py), the closed-loop sim check and Microban itself.
+  local ws="${RCR_REPO:-$REPO_ROOT/../rock-climbing-workshop}"
+  ws="$(cd "$ws" 2>/dev/null && pwd)" || { echo "rock-climbing-workshop not found (set RCR_REPO)" >&2; exit 1; }
+  local ws_python="${RCR_PYTHON:-${SIM_PYTHON:-$ws/.venv/bin/python}}" microban="${MICROBAN:-$ws/third_party/microban}"
+  local move="$ws/src/rcr/robot/climb_policy_move.py" src=() out="$DEPLOY_OUT"
+  [[ -f "$move" ]] || { echo "No $move: rock-climbing-workshop without the mjlab policy controller" >&2; exit 1; }
+  if [[ -n "$WANDB_RUN" ]]; then
+    src=(--wandb-run-path "$WANDB_RUN")
+    [[ -n "$WANDB_CHECKPOINT" ]] && src+=(--wandb-checkpoint-name "$WANDB_CHECKPOINT")
+  else
+    src=(--checkpoint-file "$CHECKPOINT")
+  fi
+  local export_cmd=(uv run python src/mjlab_microban/scripts/export_climbing_deploy.py --task "$TASK" "${src[@]}"
+    --motion-file "$MOTION_FILE" --check-steps "$CHECK_STEPS")
+  [[ -n "$out" ]] && export_cmd+=(--out "$out")
+  if $DRY_RUN; then
+    printf 'RCR_SRC=%q ' "$ws/src"; printf '%q ' "${export_cmd[@]}"; echo
+    $SIM_CHECK && echo "$ws_python $ws/scripts/sim_check_climb_policy.py <bundle> --seconds $SIM_SECONDS"
+    [[ -n "$ROBOT_HOST" ]] && echo "$ws_python $ws/scripts/link_pi.py deploy $ROBOT_HOST" \
+      && echo "rsync <bundle>/ $ROBOT_HOST:climb_policy/ && make -C $microban run HOST=$ROBOT_HOST MOVES=$move"
+    return 0
+  fi
+  echo "[INFO] Exporting $CHECKPOINT ($TASK) on $MOTION_FILE for the robot"
+  local log
+  log="$(mktemp)"
+  RCR_SRC="$ws/src" "${export_cmd[@]}" 2>&1 | tee "$log"
+  [[ ${PIPESTATUS[0]} -eq 0 ]] || { rm -f "$log"; echo "[ERROR] export failed: nothing deployed" >&2; exit 1; }
+  out="$(sed -n 's/^\[INFO\] bundle: //p' "$log" | tail -1)"
+  rm -f "$log"
+  [[ -n "$out" && -f "$out/climb_bundle.npz" ]] || { echo "[ERROR] no bundle written" >&2; exit 1; }
+
+  if $SIM_CHECK || [[ -n "$ROBOT_HOST" ]]; then
+    [[ -x "$ws_python" ]] || { echo "No rock-climbing-workshop Python at $ws_python (uv sync --group sim --group rl there, or set RCR_PYTHON)" >&2; exit 1; }
+  fi
+  if $SIM_CHECK; then
+    echo "[INFO] Closed loop in the organisers' simulator: $SIM_SECONDS s of climbing"
+    "$ws_python" "$ws/scripts/sim_check_climb_policy.py" "$out" --seconds "$SIM_SECONDS"
+  fi
+
+  if [[ -n "$ROBOT_HOST" ]]; then
+    [[ -f "$microban/Makefile" ]] || { echo "Microban not found at $microban (set MICROBAN)" >&2; exit 1; }
+    echo "[INFO] Our Pi code (rcr: controller, ...) to $ROBOT_HOST:~/rcr/src"
+    "$ws_python" "$ws/scripts/link_pi.py" deploy "$ROBOT_HOST" || { echo "[ERROR] copy of our code failed" >&2; exit 1; }
+    echo "[INFO] The bundle to $ROBOT_HOST:~/climb_policy"
+    rsync -av --delete --exclude parity.npz --exclude sim_check.npz --exclude __pycache__ "$out/" "$ROBOT_HOST:climb_policy/"
+    echo "[INFO] The robot's program with the climb_policy move (make run in $microban): robot on the wall, rope on;"
+    echo "       start the move from the dashboard, stop it to end (Ctrl+C here: the program stops, torque off)"
+    exec make -C "$microban" run HOST="$ROBOT_HOST" MOVES="$move"
+  else
+    echo "[INFO] Bundle ready: $out"
+    echo "       on the robot: $0 --deploy ... --host <robot>"
   fi
 }
 
@@ -272,6 +388,7 @@ if $PLAY; then
     CMD=(uv run play "$TASK" --checkpoint-file "$CHECKPOINT" --num-envs "$NUM_ENVS")
   fi
   $PLAY_VIDEO && CMD+=(--video True)
+  $PLAY_VISER && CMD+=(--viewer viser)
 
   if $MULTI_BOARD; then
     if [[ $# -ge 1 && "$1" != -* ]]; then
@@ -335,6 +452,11 @@ except (OSError, KeyError, TypeError, yaml.YAMLError):
     # play's --motion-file is also where the env reads its wall from (tasks/climbing/wall.py).
     CMD+=(--motion-file "$MOTION_FILE")
     echo "[INFO] Playing $CHECKPOINT ($TASK) on $MOTION_FILE"
+  fi
+
+  if $DEPLOY; then
+    deploy "$@"
+    exit 0
   fi
 
   CMD+=("$@")

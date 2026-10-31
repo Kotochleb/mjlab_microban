@@ -47,6 +47,7 @@ from mjlab_microban.robot.microban_climb_constants import (
     BALL_GEOM_NAMES,
     BALL_SITE_NAMES,
     FEET_BODY_NAMES,
+    FOOT_SOLE_GEOM_NAMES,
     GRIP_GEOM_NAMES,
     HANDLE_GEOM_NAMES,
     HANDS_BODY_NAMES,
@@ -138,6 +139,13 @@ def _robot_spec_fn(get_spec, trunk_pos):
 # The anchor (trunk) has to be part of the motion command bodies. As in the tracking task, the policy
 # tracks the position of the feet and hands, and the orientation of the head.
 TRACKED_BODY_NAMES = ("trunk",) + END_EFFECTOR_BODY_NAMES + ("head",)
+# Contact slots per ball / capsule of the grip_hold_contact sensor (its strongest contacts with the wall).
+GRIP_HOLD_CONTACT_SLOTS = 3
+# Contact slots per ball of the ball_hold_contact sensor (a seated ball touches the floor and up to two walls).
+BALL_HOLD_CONTACT_SLOTS = 3
+# Policy steps before and after the current one on which the reference has to expect a ball on a hold for
+# ball_in_hold_contact to reward it.
+BALL_IN_HOLD_WINDOW = 5
 
 
 def make_microban_climbing_env_cfg(
@@ -209,7 +217,32 @@ def make_microban_climbing_env_cfg(
         reduce="none",
         num_slots=1,
     )
-    cfg.scene.sensors = (self_collision_sensor_cfg, ball_contact_sensor_cfg, ball_block_contact_sensor_cfg)
+    # Balls and capsules on the holds, with where and in which direction they touch (mdp.hold_bottom_contact):
+    # a few slots per geom, as a capsule can touch a hold at several places.
+    grip_hold_contact_sensor_cfg = ContactSensorCfg(
+        name="grip_hold_contact",
+        primary=ContactMatch(mode="geom", pattern=GRIP_GEOM_NAMES, entity="robot"),
+        secondary=ContactMatch(mode="subtree", pattern="wall", entity="wall"),
+        fields=("pos", "normal"),
+        reduce="maxforce",
+        num_slots=GRIP_HOLD_CONTACT_SLOTS,
+    )
+    # The balls on the holds, with where and in which direction they touch (mdp.ball_in_hold_contact).
+    ball_hold_contact_sensor_cfg = ContactSensorCfg(
+        name="ball_hold_contact",
+        primary=ContactMatch(mode="geom", pattern=BALL_GEOM_NAMES, entity="robot"),
+        secondary=ContactMatch(mode="subtree", pattern="wall", entity="wall"),
+        fields=("pos", "normal"),
+        reduce="maxforce",
+        num_slots=BALL_HOLD_CONTACT_SLOTS,
+    )
+    cfg.scene.sensors = (
+        self_collision_sensor_cfg,
+        ball_contact_sensor_cfg,
+        ball_block_contact_sensor_cfg,
+        grip_hold_contact_sensor_cfg,
+        ball_hold_contact_sensor_cfg,
+    )
 
     #---------------------------- Actions ---------------------------
     joint_pos_action = cfg.actions["joint_pos"]
@@ -365,6 +398,30 @@ def make_microban_climbing_env_cfg(
             weight=-0.5,
             params={"sensor_name": ball_block_contact_sensor_cfg.name},
         ),
+        # Penalty per ball / capsule touching the bottom of a hold, from below (any other contact is allowed).
+        "hold_bottom_contact": RewardTermCfg(
+            func=mdp.hold_bottom_contact,
+            weight=-0.5,
+            params={
+                "sensor_name": grip_hold_contact_sensor_cfg.name,
+                "num_slots": GRIP_HOLD_CONTACT_SLOTS,
+                "cos_threshold": 0.7,
+            },
+        ),
+        # Bonus per ball seated in a cup (on its floor from above, or against its walls from the inside, never on a
+        # wall's top) while the reference expects it on a hold over the previous and next BALL_IN_HOLD_WINDOW steps.
+        "ball_in_hold": RewardTermCfg(
+            func=mdp.ball_in_hold_contact,
+            weight=0.5,
+            params={
+                "sensor_name": ball_hold_contact_sensor_cfg.name,
+                "command_name": "motion",
+                "geom_names": BALL_GEOM_NAMES,
+                "num_slots": BALL_HOLD_CONTACT_SLOTS,
+                "window": BALL_IN_HOLD_WINDOW,
+                "cos_threshold": 0.7,
+            },
+        ),
         "joint_limit": RewardTermCfg(
             func=tracking_mdp.joint_pos_limits,
             weight=-10.0,
@@ -412,6 +469,46 @@ def make_microban_climbing_env_cfg(
             "ranges": (0.9, 1.1),
         },
     )
+    # Link mass and inertia, per env and body, physically consistent (pseudo-inertia parameterisation): alpha
+    # scales mass and inertia by e^(2 alpha) (+-5 % here), d stretches the inertia ellipsoid per axis (inertia
+    # tensor shape, mass unchanged). The COM is left to base_com above.
+    cfg.events["link_inertia"] = EventTermCfg(
+        mode="startup",
+        func=dr.pseudo_inertia,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=(r".*",)),
+            "alpha_range": (-0.025, 0.025),
+            "d_range": (-0.05, 0.05),
+        },
+    )
+
+    # Very small random pushes on the trunk (the robot weighs ~0.81 kg, ~8 N): a constant wrench of up to
+    # 0.2 N / 0.01 N.m per axis, held 0.05-0.2 s, every 1-3 s, per env.
+    cfg.events["base_perturbation"] = EventTermCfg(
+        mode="step",
+        func=envs_mdp.apply_body_impulse,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=("trunk",)),
+            "force_range": (-0.2, 0.2),
+            "torque_range": (-0.01, 0.01),
+            "duration_s": (0.05, 0.2),
+            "cooldown_s": (1.0, 3.0),
+        },
+    )
+
+    # Foot sole boxes (85 mm long): shortened by U(0, 5 mm) at the front (box local +y = foot +z), per env and foot;
+    # the heel end stays in place.
+    cfg.events["foot_sole_length"] = EventTermCfg(
+        mode="startup",
+        func=mdp.shorten_box_geom,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", geom_names=FOOT_SOLE_GEOM_NAMES),
+            "max_shortening": 0.005,
+            "axis": 1,
+            "side": 1.0,
+        },
+    )
+
     # No dof_friction_randomization event: BAM zeroes MuJoCo's frictionloss and models the joint friction
     # itself, so the friction is randomised by the actuator_dr curriculum below instead.
 
@@ -433,12 +530,12 @@ def make_microban_climbing_env_cfg(
                 "full_steps": 1000 * 24,
             },
         )
-        # Ball sphere (collision geom) positions: +-0.5 mm in x, y and z, per env and ball, same schedule.
+        # Ball sphere (collision geom) positions: +-1 mm in x, y and z, per env and ball, same schedule.
         cfg.curriculum["ball_pos_dr"] = CurriculumTermCfg(
             func=mdp.geom_pos_dr_curriculum,
             params={
                 "asset_cfg": SceneEntityCfg("robot", geom_names=BALL_GEOM_NAMES),
-                "max_offset": 0.0005,
+                "max_offset": 0.001,
                 "start_frac": 0.01,
                 "hold_steps": 500 * 24,
                 "full_steps": 1000 * 24,

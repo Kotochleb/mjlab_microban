@@ -36,6 +36,8 @@ HAND_CAPSULE_GEOM_NAMES = ("left_hand_capsule_coll", "right_hand_capsule_coll")
 HANDLE_GEOM_NAMES = BALL_GEOM_NAMES + HAND_CAPSULE_GEOM_NAMES
 # Capsules above the foot balls (contype WORLD: they touch the 1-box blocks and the 5-box cup lips).
 FOOT_CAPSULE_GEOM_NAMES = ("left_foot_ball_capsule_coll", "right_foot_ball_capsule_coll")
+# Thin sole box per foot; its local +y end is the front of the foot (+z of the foot body).
+FOOT_SOLE_GEOM_NAMES = ("left_foot_sole_coll", "right_foot_sole_coll")
 # The end-effector geoms that grip the holds: their friction (priority 1) sets that of their contacts.
 GRIP_GEOM_NAMES = BALL_GEOM_NAMES + HAND_CAPSULE_GEOM_NAMES + FOOT_CAPSULE_GEOM_NAMES
 HANDS_BODY_NAMES = ("radius_left", "radius_right")
