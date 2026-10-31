@@ -254,7 +254,7 @@ def make_microban_climbing_env_cfg(
     #---------------------------- Viewer ----------------------------
     cfg.viewer.body_name = "trunk"
     cfg.viewer.distance = 1.0
-    cfg.viewer.azimuth = 200.0  # behind the robot, looking at the wall
+    cfg.viewer.azimuth = 20.0  # in front of the robot (wall side), so the robot is visible
 
     #---------------------------- State estimation ------------------
     if not has_state_estimation:

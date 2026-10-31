@@ -6,6 +6,7 @@ import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
+import numpy as np
 import torch
 
 from mjlab.entity import Entity
@@ -112,7 +113,7 @@ def _ball_site_offsets(
         offsets.append(mj_model.site_pos[site.id].copy())
     return (
         torch.tensor(cmd_body_idx, device=env.device),
-        torch.tensor(offsets, dtype=torch.float32, device=env.device),  # [N, 3]
+        torch.tensor(np.array(offsets), dtype=torch.float32, device=env.device),  # [N, 3]
     )
 
 
@@ -146,7 +147,12 @@ class ball_position_error_exp:
         offsets = self.offsets.expand(body_pos.shape[0], -1, -1)
         ref_pos = body_pos + quat_apply(body_quat, offsets)
         error = torch.sum(torch.square(ref_pos - asset.data.site_pos_w[:, self.site_ids]), dim=-1)  # [B, N]
-        env.extras["log"]["Metrics/ball_pos_error_mean"] = torch.sqrt(error).mean()
+        # Envs whose physics just blew up (NaN state, reset by nan_detection right after the rewards) would
+        # make the batch mean NaN: average over the finite ones and log how many were not.
+        ball_err = torch.sqrt(error).mean(dim=-1)  # [B]
+        finite = torch.isfinite(ball_err)
+        env.extras["log"]["Metrics/ball_pos_error_mean"] = ball_err[finite].mean()
+        env.extras["log"]["Metrics/nonfinite_envs"] = (~finite).sum().float()
         return torch.exp(-error.mean(dim=-1) / std**2)
 
 
