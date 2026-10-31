@@ -33,7 +33,7 @@ from mjlab_microban.tasks.tracking import mdp
 # Note that the Onshape export names the right foot "foot" and the left one
 # "foot_2" (same for the forearms "radius"/"radius_2", used as hands).
 FEET_BODY_NAMES = ("foot_2", "foot")
-HANDS_BODY_NAMES = ("radius_2", "radius")
+HANDS_BODY_NAMES = ("left_hand", "right_hand")
 END_EFFECTOR_BODY_NAMES = FEET_BODY_NAMES + HANDS_BODY_NAMES
 
 # The anchor (trunk) has to be part of the motion command bodies. The policy
@@ -142,9 +142,9 @@ def make_microban_tracking_env_cfg(
     # Loosen tracking precision so the policy receives useful gradient from the
     # start rather than near-zero signal when the initial error is large
     # (0.7 on the full-size Kangaroo, scaled down for position terms).
-    cfg.rewards["motion_global_root_pos"].params["std"] = 0.18
+    cfg.rewards["motion_global_root_pos"].params["std"] = 0.03
     cfg.rewards["motion_global_root_ori"].params["std"] = 0.7
-    cfg.rewards["motion_body_pos"].params["std"] = 0.18
+    cfg.rewards["motion_body_pos"].params["std"] = 0.2
     cfg.rewards["motion_body_ori"].params["std"] = 0.7
 
     # Near the reference the reward curvature scales with weight / std^2, so
@@ -156,7 +156,7 @@ def make_microban_tracking_env_cfg(
     cfg.rewards["motion_body_pos"].weight = 6.0
     cfg.rewards["motion_body_ori"].weight = 4.0
     cfg.rewards["motion_body_pos"].params["body_names"] = END_EFFECTOR_BODY_NAMES
-    cfg.rewards["motion_body_lin_vel"].params["std"] = 0.3
+    cfg.rewards["motion_body_lin_vel"].params["std"] = 0.05
     cfg.rewards["motion_body_lin_vel"].params["body_names"] = END_EFFECTOR_BODY_NAMES
 
     cfg.rewards["motion_global_root_lin_vel_z"] = RewardTermCfg(
@@ -168,8 +168,8 @@ def make_microban_tracking_env_cfg(
     cfg.rewards["motion_body_ori"].params["body_names"] = ("head",)
     cfg.rewards["motion_body_ang_vel"].params["body_names"] = ("head",)
 
-    # Reduce action-rate penalty so it does not crush exploration early on.
-    cfg.rewards["action_rate_l2"].weight = -1e-3
+    # Same as the velocity task.
+    cfg.rewards["action_rate_l2"].weight = -0.1
 
     cfg.rewards["self_collisions"].params["force_threshold"] = 1.0
 

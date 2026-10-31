@@ -7,4 +7,4 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 
 # Importing each task package registers its tasks with mjlab.
-from mjlab_microban.tasks import tracking, velocity  # noqa: F401
+from mjlab_microban.tasks import climbing, tracking, velocity  # noqa: F401

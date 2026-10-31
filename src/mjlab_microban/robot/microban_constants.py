@@ -18,43 +18,8 @@ from mjlab.utils.spec_config import CollisionCfg
 MICROBAN_XML: Path = Path(os.path.dirname(__file__)) / "microban" / "robot.xml"
 assert MICROBAN_XML.exists(), f"XML not found: {MICROBAN_XML}"
 
-# Unnamed collision geoms of the generated XML, as (body, index of the geom within the body).
-# get_spec names them "<body>_collision_<index>" so CollisionCfg and contact pairs can select them.
-NAMED_COLLISION_GEOMS = (
-    ("trunk", 2),
-    ("radius", 0),
-    ("radius", 1),
-    ("radius_2", 0),
-    ("radius_2", 1),
-    ("hip_block__configuration_right", 2),
-    ("hip_block__configuration_left", 2),
-    ("ankle_block__configuration_right", 2),
-    ("ankle_block__configuration_left", 2),
-)
-
-# The only robot self-collisions; every other pair of robot geoms never collides.
-SELF_COLLISION_PAIRS = (
-    ("left_foot_collision_2", "right_foot_collision_2"),
-    ("ankle_block__configuration_left_collision_2", "ankle_block__configuration_right_collision_2"),
-    ("radius_2_collision_0", "trunk_collision_2"),
-    ("radius_collision_0", "trunk_collision_2"),
-)
-
-
 def get_spec() -> mujoco.MjSpec:
-    spec = mujoco.MjSpec.from_file(str(MICROBAN_XML))
-    for body_name, index in NAMED_COLLISION_GEOMS:
-        geom = spec.body(body_name).geoms[index]
-        assert geom.classname.name == "collision", f"{body_name} geom {index} is not a collision geom"
-        geom.name = f"{body_name}_collision_{index}"
-    # Disable every geom; ENV_COLLISION re-enables the ones touching the environment.
-    for geom in spec.geoms:
-        geom.contype = 0
-        geom.conaffinity = 0
-    # Explicit pairs bypass contype/conaffinity.
-    for geom1, geom2 in SELF_COLLISION_PAIRS:
-        spec.add_pair(name=f"{geom1}__{geom2}", geomname1=geom1, geomname2=geom2)
-    return spec
+    return mujoco.MjSpec.from_file(str(MICROBAN_XML))
 
 HOME_FRAME = EntityCfg.InitialStateCfg(
     pos=(0.0, 0.0, 0.168), #0.1676),
@@ -82,17 +47,8 @@ HOME_FRAME = EntityCfg.InitialStateCfg(
     joint_vel={r".*": 0.0},
 )
 
-# Geoms colliding with the environment. contype=1/conaffinity=0 collides with the terrain
-# (contype=conaffinity=1) but never with another robot geom; see SELF_COLLISION_PAIRS for those.
-ENV_COLLISION = CollisionCfg(
-    geom_names_expr=(
-        r"^(left|right)_foot_collision_[3-6]$",
-        r"^radius(_2)?_collision_[01]$",
-        r"^trunk_collision_2$",
-        r"^hip_block__configuration_(right|left)_collision_2$",
-    ),
-    contype=1,
-    conaffinity=0,
+FULL_COLLISION = CollisionCfg(
+    geom_names_expr=(r".*_collision",),
     condim={r"^(left|right)_foot_collision$": 3, r".*_collision": 1},
     priority={r"^(left|right)_foot_collision$": 1},
     friction={r"^(left|right)_foot_collision$": (1.0,)},
@@ -123,7 +79,7 @@ actuators = BamActuatorCfg(
 MICROBAN_ROBOT_CFG = EntityCfg(
     spec_fn=get_spec,
     init_state=HOME_FRAME,
-    collisions=(ENV_COLLISION,),
+    collisions=(FULL_COLLISION,),
     articulation=EntityArticulationInfoCfg(
         actuators=(actuators,),
         soft_joint_pos_limit_factor=0.9,
