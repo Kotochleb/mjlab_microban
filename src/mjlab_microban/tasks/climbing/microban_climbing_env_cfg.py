@@ -28,6 +28,7 @@ from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs import mdp as envs_mdp
 from mjlab.envs.mdp import dr
 from mjlab.envs.mdp.actions import JointPositionActionCfg
+from mjlab.managers.curriculum_manager import CurriculumTermCfg
 from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.observation_manager import ObservationGroupCfg, ObservationTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
@@ -415,6 +416,15 @@ def make_microban_climbing_env_cfg(
             "ranges": (0.9, 1.1),
         },
     )
+
+    #---------------------------- Curriculum ------------------------
+    # Boosted motors (15 V, 3 A) at the start, linearly down to the realistic ones (the BAM actuator config's
+    # vin_range / max_current) over 500 training iterations of 24 env steps each.
+    if not play:
+        cfg.curriculum["bam_power"] = CurriculumTermCfg(
+            func=mdp.bam_power_curriculum,
+            params={"vin_start": 15.0, "max_current_start": 3.0, "num_steps": 500 * 24},
+        )
 
     #---------------------------- Terminations ----------------------
     cfg.terminations["anchor_pos"].params["threshold"] = 0.07

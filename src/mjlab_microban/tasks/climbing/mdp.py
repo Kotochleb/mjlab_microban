@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import torch
+import warp as wp
 
 from bam.mjlab import BamActuator
 from mjlab.entity import Entity
@@ -335,6 +336,70 @@ def set_pd_gain(
 ) -> None:
     """Set the firmware P gain (kp_fw units) of all BAM actuators, for all envs (startup event)."""
     set_bam_kp(env.scene[asset_cfg.name], kp)
+
+
+class bam_power_curriculum:
+    """Curriculum on the BAM motor power: starts with a boosted supply voltage and current limit and goes
+    linearly down to the realistic ones (the actuator config's) over ``num_steps`` env steps.
+
+    Every env interpolates from ``vin_start`` to its own startup-sampled battery voltage (``vin_range``), and the
+    firmware current limit from ``max_current_start`` to the config's ``max_current``. The load voltage drop and
+    ``vin_min`` still apply on top. MuJoCo's actuator force range (set by BAM from the realistic max voltage) is
+    raised once so it does not clip the boosted torques; it stays a ceiling above the realistic limits after.
+
+    Only the physics change: the residual action scale and the torque utilisation barrier keep using
+    the realistic effort limit / the current limit, respectively (the latter follows the curriculum).
+    Curriculum terms run on env resets, so the values are updated whenever some env resets.
+    """
+
+    def __init__(self, cfg, env: ManagerBasedRlEnv):
+        asset: Entity = env.scene[cfg.params.get("asset_cfg", _DEFAULT_ASSET_CFG).name]
+        vin_start = float(cfg.params["vin_start"])
+        max_current_start = float(cfg.params["max_current_start"])
+        self._acts = _bam_actuators(asset)
+        self._vin_final = [act.vin_tensor.clone() for act in self._acts]  # [B, 1], realistic per-env voltage
+        self._max_current_final = [act.cfg.max_current for act in self._acts]
+        # Each actuator gets its own copy of the config: it may be shared with other robots / tasks.
+        for act in self._acts:
+            act.cfg = replace(act.cfg)
+
+        # The raw array is [1 or B, nu, 2] (1 when shared by all worlds); the bridge's view broadcasts it.
+        forcerange = wp.to_torch(env.sim.model.actuator_forcerange.wp_array)
+        for act in self._acts:
+            bam = act._bam_model
+            kt, R = bam.kt.value, bam.R.value
+            limit = kt / R * vin_start * bam.actuator.max_pwm
+            limit = min(limit, max_current_start * kt)
+            # Add a margin for the friction torque BAM adds on top of the motor torque.
+            limit *= 1.1
+            ids = act.global_ctrl_ids
+            new = torch.clamp(forcerange[..., ids, 1], min=limit)
+            forcerange[..., ids, 0] = -new
+            forcerange[..., ids, 1] = new
+
+    def __call__(
+        self,
+        env: ManagerBasedRlEnv,
+        env_ids: torch.Tensor | slice,
+        vin_start: float,
+        max_current_start: float,
+        num_steps: int,
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    ) -> dict[str, float]:
+        del env_ids, asset_cfg
+        alpha = min(max(env.common_step_counter / num_steps, 0.0), 1.0)
+        for act, vin_final, max_current_final in zip(
+            self._acts, self._vin_final, self._max_current_final, strict=True
+        ):
+            act.vin_tensor[:] = vin_start + alpha * (vin_final - vin_start)
+            if max_current_final is not None:
+                act.cfg.max_current = max_current_start + alpha * (max_current_final - max_current_start)
+        act = self._acts[0]
+        return {
+            "progress": alpha,
+            "vin_mean": float(act.vin_tensor.mean()),
+            "max_current": float(act.cfg.max_current) if act.cfg.max_current is not None else float("nan"),
+        }
 
 
 def bam_torque_utilisation(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG) -> torch.Tensor:

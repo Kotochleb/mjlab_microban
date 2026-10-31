@@ -87,3 +87,40 @@ MicrobanClimbingConv1dRlCfg = _with_future_conv1d(MicrobanClimbingRlCfg, "mjlab_
 MicrobanClimbingResidualConv1dRlCfg = _with_future_conv1d(
     MicrobanClimbingResidualRlCfg, "mjlab_microban_climbing_residual_conv1d"
 )
+
+# Conv1d + history variant (microban_climbing_conv1d_history_env_cfg.py): as the Conv1d variant, and the actor's
+# proprioception is a 0.5 s history ([B, 25, C]) with its own Conv1d encoder (temporal_conv_model.py); its newest
+# frame also goes to the MLP head directly. 25 frames -> (k5, s2) 11 -> (k3, s2) 5 -> (k3, s1) 3, x 32 channels:
+# 96 history features. The critic is the Conv1d variant's.
+_TEMPORAL_CONV1D_MODEL = "mjlab_microban.tasks.climbing.temporal_conv_model:TemporalConv1dModel"
+_HISTORY_CONV1D_LAYERS = {"channels": (64, 64, 32), "kernel_size": (5, 3, 3), "stride": (2, 2, 1)}
+
+
+def _with_history_conv1d(base: RslRlOnPolicyRunnerCfg, experiment_name: str) -> RslRlOnPolicyRunnerCfg:
+    from mjlab_microban.tasks.climbing.microban_climbing_conv1d_env_cfg import (
+        ACTOR_FUTURE_GROUP,
+        FUTURE_CONV_FRAMES,
+    )
+    from mjlab_microban.tasks.climbing.microban_climbing_conv1d_history_env_cfg import (
+        ACTOR_HISTORY_GROUP,
+        HISTORY_CONV_FRAMES,
+    )
+
+    cfg = _with_future_conv1d(base, experiment_name)
+    cfg.obs_groups = {**cfg.obs_groups, "actor": (ACTOR_HISTORY_GROUP, ACTOR_FUTURE_GROUP)}
+    cfg.actor.class_name = _TEMPORAL_CONV1D_MODEL
+    cfg.actor.cnn_cfg = {
+        "encoders": {
+            ACTOR_HISTORY_GROUP: {"num_frames": HISTORY_CONV_FRAMES, "direct_frame": -1, **_HISTORY_CONV1D_LAYERS},
+            ACTOR_FUTURE_GROUP: {"num_frames": FUTURE_CONV_FRAMES, **_FUTURE_CONV1D_LAYERS},
+        }
+    }
+    return cfg
+
+
+MicrobanClimbingConv1dHistoryRlCfg = _with_history_conv1d(
+    MicrobanClimbingRlCfg, "mjlab_microban_climbing_conv1d_history"
+)
+MicrobanClimbingResidualConv1dHistoryRlCfg = _with_history_conv1d(
+    MicrobanClimbingResidualRlCfg, "mjlab_microban_climbing_residual_conv1d_history"
+)
