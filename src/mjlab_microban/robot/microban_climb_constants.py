@@ -47,6 +47,15 @@ def get_spec() -> mujoco.MjSpec:
                 geom.name = f"{body.name}_collision_{i}"
                 i += 1
 
+    # Put the trunk at the climb start pose in the model, so that qpos0 is not the trunk at the origin,
+    # buried in the floor. mjlab builds its initial MjData at qpos0 and mujoco_warp sizes its per-world
+    # contact / constraint buffers from it: buried, it has ~1100 contacts and ~4500 constraint rows,
+    # which made njmax default to 6144 and the buffers take many GB at 4096 envs. The free joint state is
+    # written in absolute world coordinates, so this changes nothing else.
+    trunk = spec.body("trunk")
+    trunk.pos = CLIMB_START_FRAME.pos
+    trunk.quat = CLIMB_START_FRAME.rot
+
     for geom in spec.geoms:
         if geom.name in BALL_GEOM_NAMES:
             geom.condim = 3

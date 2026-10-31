@@ -8,6 +8,8 @@
 
 """Microban climbing RL configuration (copied from tasks/tracking/rl_cfg.py)"""
 
+from copy import deepcopy
+
 from mjlab.rl import (
     RslRlModelCfg,
     RslRlOnPolicyRunnerCfg,
@@ -51,3 +53,9 @@ MicrobanClimbingRlCfg = RslRlOnPolicyRunnerCfg(
     num_steps_per_env=24,
     max_iterations=30_000,
 )
+
+# Residual variant: with the 0.25 action scale, an initial std of 0.5 gives ~0.125 rad of exploration
+# noise around the reference instead of swamping it.
+MicrobanClimbingResidualRlCfg = deepcopy(MicrobanClimbingRlCfg)
+MicrobanClimbingResidualRlCfg.actor.distribution_cfg["init_std"] = 0.5
+MicrobanClimbingResidualRlCfg.experiment_name = "mjlab_microban_climbing_residual"

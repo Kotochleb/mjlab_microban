@@ -24,7 +24,7 @@ from mjlab.envs import mdp as envs_mdp
 from mjlab.envs.mdp import dr
 from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers.event_manager import EventTermCfg
-from mjlab.managers.observation_manager import ObservationGroupCfg
+from mjlab.managers.observation_manager import ObservationGroupCfg, ObservationTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import ContactMatch, ContactSensorCfg
@@ -44,6 +44,12 @@ from mjlab_microban.tasks.climbing.wall import WALL_CFG
 
 END_EFFECTOR_BODY_NAMES = FEET_BODY_NAMES + HANDS_BODY_NAMES
 
+# Number of future motion frames (policy steps, 50 Hz) the policy observes, as a rolling window.
+FUTURE_WINDOW_STEPS = 20
+
+# Residual variant: action scale (rad per unit action) on top of the reference joint positions.
+RESIDUAL_ACTION_SCALE = 0.25
+
 # The anchor (trunk) has to be part of the motion command bodies. As in the tracking task, the policy
 # tracks the position of the feet and hands, and the orientation of the head.
 TRACKED_BODY_NAMES = ("trunk",) + END_EFFECTOR_BODY_NAMES + ("head",)
@@ -52,6 +58,7 @@ TRACKED_BODY_NAMES = ("trunk",) + END_EFFECTOR_BODY_NAMES + ("head",)
 def make_microban_climbing_env_cfg(
     has_state_estimation: bool = True,
     play: bool = False,
+    residual: bool = False,
 ) -> ManagerBasedRlEnvCfg:
     cfg = make_tracking_env_cfg()
 
@@ -85,7 +92,17 @@ def make_microban_climbing_env_cfg(
     #---------------------------- Actions ---------------------------
     joint_pos_action = cfg.actions["joint_pos"]
     assert isinstance(joint_pos_action, JointPositionActionCfg)
-    joint_pos_action.scale = 1.0
+    if residual:
+        # The policy outputs corrections on the reference joint positions (of the frame the step ends
+        # on); a small scale so that the untrained policy roughly plays back the reference.
+        cfg.actions["joint_pos"] = mdp.ResidualJointPositionActionCfg(
+            entity_name=joint_pos_action.entity_name,
+            actuator_names=joint_pos_action.actuator_names,
+            scale=RESIDUAL_ACTION_SCALE,
+            command_name="motion",
+        )
+    else:
+        joint_pos_action.scale = 1.0
 
     #---------------------------- Commands --------------------------
     motion_cmd = cfg.commands["motion"]
@@ -112,6 +129,18 @@ def make_microban_climbing_env_cfg(
     #---------------------------- Observations ----------------------
     cfg.observations["actor"].terms["motion_anchor_pos_b"].noise = Unoise(n_min=-0.06, n_max=0.06)
     cfg.observations["actor"].terms["base_lin_vel"].noise = Unoise(n_min=-0.15, n_max=0.15)
+
+    # Rolling window over the next FUTURE_WINDOW_STEPS frames of the planned climb (anchor pose, ball
+    # positions and joint positions), for both the actor and the critic.
+    for group in ("actor", "critic"):
+        cfg.observations[group].terms["motion_future"] = ObservationTermCfg(
+            func=mdp.motion_future_window,
+            params={
+                "command_name": "motion",
+                "site_names": BALL_SITE_NAMES,
+                "num_steps": FUTURE_WINDOW_STEPS,
+            },
+        )
 
     #---------------------------- Rewards ---------------------------
     # Climbing rewards: track the balls (what goes into the holds), very slightly the joint configuration
