@@ -24,7 +24,7 @@ from mjlab.tasks.tracking.mdp import MotionCommandCfg
 from mjlab.tasks.tracking.tracking_env_cfg import make_tracking_env_cfg
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 
-from mjlab_microban.robot.microban_constants import MICROBAN_ROBOT_CFG
+from mjlab_microban.robot.microban_constants import MICROBAN_HULLS_ROBOT_CFG
 from mjlab_microban.tasks.tracking import mdp
 
 # Microban is roughly 4x smaller than the G1 the base tracking config was tuned
@@ -64,7 +64,7 @@ def make_microban_tracking_env_cfg(
 
     # Actuator delays are counted in physics steps; the robot defaults (3-6
     # steps of 5 ms) match the velocity task.
-    cfg.scene.entities = {"robot": deepcopy(MICROBAN_ROBOT_CFG)}
+    cfg.scene.entities = {"robot": deepcopy(MICROBAN_HULLS_ROBOT_CFG)}
 
     #---------------------------- Sensors ---------------------------
     self_collision_sensor_cfg = ContactSensorCfg(

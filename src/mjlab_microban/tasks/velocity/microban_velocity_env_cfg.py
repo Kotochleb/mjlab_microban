@@ -16,7 +16,7 @@ from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import ContactMatch, ContactSensorCfg
 
-from mjlab_microban.robot.microban_constants import MICROBAN_ROBOT_CFG
+from mjlab_microban.robot.microban_constants import MICROBAN_HULLS_ROBOT_CFG
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 
 from mjlab.managers.event_manager import EventTermCfg
@@ -71,7 +71,7 @@ SCENE_CFG = SceneCfg(
     ),
     num_envs=1,
     extent=2.0,
-    entities={"robot": MICROBAN_ROBOT_CFG},
+    entities={"robot": MICROBAN_HULLS_ROBOT_CFG},
 )
 
 VIEWER_CONFIG = ViewerConfig(

@@ -8,9 +8,15 @@
 
 """Microban climbing variant (ball hands and feet).
 
-The MJCF in microban_climb/ is copied from ../microban_model/src/microban_model/mjcf/robot_climb.xml
+The MJCF in microban_climb/ is based on ../microban_model/src/microban_model/mjcf/robot_climb.xml
 (the model used by ../planning/trajecoty.py and ../microban_mpc/climb_mpc.py). It has the same joints as
-the walking Microban, but the forearms and feet end in 12.5 mm balls that hook into the holds.
+the walking Microban, but the forearms and feet end in 12.5 mm radius balls that hook into the holds.
+Collision geometry is limited to trunk and head boxes, two arm servo boxes, one box per forearm and thigh,
+the four hook spheres, and one thin sole box per foot. Each thigh box encloses the original three
+boxes from microban/robot.xml and spans the full thigh geometry, including its 41 mm thickness.
+Each arm's two servo boxes are merged into one enclosing box enlarged by 3%.
+Each forearm box encloses the elbow joint and the 9 mm radius hand sphere defined by the velocity model.
+The head box follows the head joint and extends down to the top of the trunk box.
 """
 
 import os
@@ -36,16 +42,12 @@ def get_spec() -> mujoco.MjSpec:
     for act in list(spec.actuators):
         spec.delete(act)
 
-    # Name the collision geoms ("<body>_collision_<i>") so they can be selected by regex. The
-    # contype/conaffinity of the MJCF are kept on purpose: body parts (contype 1, conaffinity 2) do not
-    # collide with each other, the balls (contype 3) collide with the body, and everything (contype 1)
-    # collides with the floor and the wall (conaffinity 1).
-    for body in spec.bodies:
-        i = 0
-        for geom in body.geoms:
-            if geom.group == 3 and not geom.name:
-                geom.name = f"{body.name}_collision_{i}"
-                i += 1
+    # Named primitives: trunk_box_coll, head_box_coll, *_servo_coll, *_forearm_box_coll, *_thigh_box_coll,
+    # *_ball_coll and *_foot_sole_coll. Keep the MJCF masks: trunk, head, servos, forearms and thighs
+    # (contype 1, conaffinity 2), balls and soles (contype 3, conaffinity 2). End effectors can
+    # collide with body boxes and each other; all geoms can contact the floor and wall (conaffinity 1).
+    unnamed = [body.name for body in spec.bodies for geom in body.geoms if geom.group == 3 and not geom.name]
+    assert not unnamed, f"unnamed collision geoms on bodies {sorted(set(unnamed))}"
 
     # Put the trunk at the climb start pose in the model, so that qpos0 is not the trunk at the origin,
     # buried in the floor. mjlab builds its initial MjData at qpos0 and mujoco_warp sizes its per-world

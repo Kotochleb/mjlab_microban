@@ -15,7 +15,7 @@ from mjlab.envs.mdp.actions import JointPositionAction, JointPositionActionCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import ContactSensor, TerrainHeightSensor
 from mjlab.tasks.tracking.mdp import MotionCommand
-from mjlab.utils.lab_api.math import matrix_from_quat, quat_apply, quat_inv, quat_mul
+from mjlab.utils.lab_api.math import matrix_from_quat, quat_apply, quat_error_magnitude, quat_inv, quat_mul
 
 if TYPE_CHECKING:
     from mjlab.envs import ManagerBasedRlEnv
@@ -140,7 +140,10 @@ class ball_position_error_exp:
         std: float,
         site_names: tuple[str, ...],
         asset_name: str = "robot",
+        reduction: str = "mean",
     ) -> torch.Tensor:
+        """exp(-e / std^2), e being the mean (or, with reduction="sum", the sum as in DeepMimic's end-effector
+        reward) over the balls of the squared position errors."""
         command = cast(MotionCommand, env.command_manager.get_term(command_name))
         asset: Entity = env.scene[asset_name]
         body_pos = command.body_pos_w[:, self.cmd_body_idx]  # [B, N, 3]
@@ -154,7 +157,8 @@ class ball_position_error_exp:
         finite = torch.isfinite(ball_err)
         env.extras["log"]["Metrics/ball_pos_error_mean"] = ball_err[finite].mean()
         env.extras["log"]["Metrics/nonfinite_envs"] = (~finite).sum().float()
-        return torch.exp(-error.mean(dim=-1) / std**2)
+        error = error.sum(dim=-1) if reduction == "sum" else error.mean(dim=-1)
+        return torch.exp(-error / std**2)
 
 
 def motion_joint_pos_error_exp(
@@ -170,6 +174,45 @@ def motion_joint_pos_error_exp(
     return torch.exp(-error / std**2)
 
 
+# ---------------------------------------------------------------------------------------------------------
+# DeepMimic imitation reward terms (Peng et al., "DeepMimic", SIGGRAPH 2018): exp(-k * squared error)
+# ---------------------------------------------------------------------------------------------------------
+
+
+def deepmimic_pose_exp(
+    env: ManagerBasedRlEnv, command_name: str, k: float, asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG
+) -> torch.Tensor:
+    """Pose reward: joint angle errors plus the root orientation error (angle), squared and summed."""
+    command = cast(MotionCommand, env.command_manager.get_term(command_name))
+    asset: Entity = env.scene[asset_cfg.name]
+    joint_err = torch.sum(torch.square(command.joint_pos - asset.data.joint_pos), dim=-1)
+    root_err = torch.square(quat_error_magnitude(command.anchor_quat_w, command.robot_anchor_quat_w))
+    return torch.exp(-k * (joint_err + root_err))
+
+
+def deepmimic_velocity_exp(
+    env: ManagerBasedRlEnv, command_name: str, k: float, asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG
+) -> torch.Tensor:
+    """Velocity reward: joint velocity errors plus the root angular velocity error, squared and summed."""
+    command = cast(MotionCommand, env.command_manager.get_term(command_name))
+    asset: Entity = env.scene[asset_cfg.name]
+    joint_err = torch.sum(torch.square(command.joint_vel - asset.data.joint_vel), dim=-1)
+    root_err = torch.sum(torch.square(command.anchor_ang_vel_w - command.robot_anchor_ang_vel_w), dim=-1)
+    return torch.exp(-k * (joint_err + root_err))
+
+
+def deepmimic_root_position_exp(env: ManagerBasedRlEnv, command_name: str, k: float) -> torch.Tensor:
+    """Root (trunk) position reward, in the world frame: DeepMimic's centre-of-mass term on the root."""
+    command = cast(MotionCommand, env.command_manager.get_term(command_name))
+    err = torch.sum(torch.square(command.anchor_pos_w - command.robot_anchor_pos_w), dim=-1)
+    return torch.exp(-k * err)
+
+
+def residual_action_l2(env: ManagerBasedRlEnv, action_name: str = "joint_pos") -> torch.Tensor:
+    """Squared norm of the policy's residual (raw action): keeps the policy close to the reference."""
+    return torch.sum(torch.square(env.action_manager.get_term(action_name).raw_action), dim=-1)
+
+
 def motion_global_anchor_position_z_error_exp(
     env: ManagerBasedRlEnv, command_name: str, std: float
 ) -> torch.Tensor:
@@ -180,15 +223,14 @@ def motion_global_anchor_position_z_error_exp(
 
 
 class motion_future_window:
-    """Rolling window over the next ``num_steps`` frames of the reference motion.
+    """Rolling window over future frames of the reference motion.
 
-    At every policy step the window covers frames t+stride, t+2*stride, ..., t+num_steps*stride of the
-    motion (t being the current motion time step), so it slides along the trajectory as the episode
-    runs. Frames past the end of the motion are clamped to its last frame.
+    At every policy step the window covers frames t+o for o in ``offsets`` (t being the current motion
+    time step), so it slides along the trajectory as the episode runs; the offsets can get sparser further
+    ahead. Frames past the end of the motion are clamped to its last frame.
 
     Every frame is expressed in the *current reference* anchor (trunk) frame, so the term only depends
-    on the motion (no robot state, hence no state estimation needed); the policy relates it to the
-    robot through motion_anchor_pos_b / motion_anchor_ori_b. Per frame:
+    on the motion (no robot state); the critic relates it to the robot through its anchor pose terms. Per frame:
       - anchor position (3) and orientation (first two rotation matrix columns, 6),
       - ball positions (3 per ball site),
       - joint positions, relative to the current reference joint positions.
@@ -196,9 +238,7 @@ class motion_future_window:
 
     def __init__(self, cfg, env: ManagerBasedRlEnv):
         command = cast(MotionCommand, env.command_manager.get_term(cfg.params["command_name"]))
-        num_steps = cfg.params.get("num_steps", 20)
-        stride = cfg.params.get("stride", 1)
-        self.future = torch.arange(1, num_steps + 1, device=env.device) * stride  # [K]
+        self.future = torch.tensor(cfg.params["offsets"], device=env.device)  # [K]
         self.cmd_body_idx, self.ball_offsets = _ball_site_offsets(
             env, command, tuple(cfg.params["site_names"]), cfg.params.get("asset_name", "robot")
         )
@@ -208,8 +248,7 @@ class motion_future_window:
         env: ManagerBasedRlEnv,
         command_name: str,
         site_names: tuple[str, ...],
-        num_steps: int = 20,
-        stride: int = 1,
+        offsets: tuple[int, ...],
         asset_name: str = "robot",
     ) -> torch.Tensor:
         command = cast(MotionCommand, env.command_manager.get_term(command_name))
@@ -308,6 +347,150 @@ def pd_gain_curriculum(
     kp = kp_start + (kp_end - kp_start) * frac
     set_bam_kp(env.scene[asset_cfg.name], kp)
     return torch.tensor(kp)
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Privileged (critic) terms: contacts, contact schedule of the reference, tracking errors, torques
+# ---------------------------------------------------------------------------------------------------------
+
+
+class ball_contacts:
+    """Ball-wall contact flags (N) and net contact forces in the world frame (N * 3), in ``geom_names`` order.
+
+    The contact sensor lists its geoms in model order; they are put back in ``geom_names`` order (the order
+    of the ball sites used by the other terms).
+    """
+
+    def __init__(self, cfg, env: ManagerBasedRlEnv):
+        asset_name = cfg.params.get("asset_name", "robot")
+        names = tuple(cfg.params["geom_names"])
+        ids = [env.sim.mj_model.geom(f"{asset_name}/{n}").id for n in names]
+        model_order = sorted(range(len(names)), key=lambda i: ids[i])  # sensor slot -> geom_names index
+        self.perm = torch.tensor([model_order.index(i) for i in range(len(names))], device=env.device)  # name -> slot
+
+    def __call__(
+        self, env: ManagerBasedRlEnv, sensor_name: str, geom_names: tuple[str, ...], asset_name: str = "robot"
+    ) -> torch.Tensor:
+        sensor: ContactSensor = env.scene[sensor_name]
+        assert sensor.data.found is not None and sensor.data.force is not None
+        found = (sensor.data.found[:, self.perm] > 0).float()
+        force = sensor.data.force[:, self.perm].reshape(found.shape[0], -1)
+        return torch.cat([found, force], dim=-1)
+
+
+class motion_contact_schedule:
+    """Where and when the reference expects the balls to be on holds.
+
+    The planned motion has no contact labels: a ball is expected in contact on the frames where its
+    reference position is within ``threshold`` of a hold socket (``hold_positions``, env frame: the centre
+    of a ball hooked in the hold, wall.hold_positions).
+    Per ball:
+      - expected contact now (1) and at the frames t+o for o in ``offsets`` (K),
+      - position of the next expected contact (the hold, from frame t on), in the robot's trunk frame (3),
+      - time until that contact [s], clipped to ``max_time`` (1); 0 while it is expected now.
+    After the last contact of the motion, the next contact is the last one.
+    """
+
+    def __init__(self, cfg, env: ManagerBasedRlEnv):
+        command = cast(MotionCommand, env.command_manager.get_term(cfg.params["command_name"]))
+        motion = command.motion
+        idx, offs = _ball_site_offsets(env, command, tuple(cfg.params["site_names"]), cfg.params.get("asset_name", "robot"))
+        body_pos, body_quat = motion.body_pos_w[:, idx], motion.body_quat_w[:, idx]  # [T, N, ...], env frame
+        ball_ref = body_pos + quat_apply(body_quat, offs.expand_as(body_pos))
+        holds = torch.tensor(cfg.params["hold_positions"], dtype=torch.float32, device=env.device)  # [H, 3], env frame
+        dist, hold_id = torch.cdist(ball_ref, holds[None].expand(ball_ref.shape[0], -1, -1)).min(dim=-1)  # [T, N]
+        self.contact = dist < cfg.params.get("threshold", 0.003)  # [T, N]
+
+        # Next expected contact frame from each frame on (backward scan); after the last one, the last one.
+        contact = self.contact.cpu().numpy()
+        T, N = contact.shape
+        nxt = np.empty((T, N), dtype=np.int64)
+        last = np.full(N, -1)
+        for t in range(T - 1, -1, -1):
+            last = np.where(contact[t], t, last)
+            nxt[t] = last
+        for n in range(N):  # no contact left: the last contact of the motion (or the last frame)
+            c = np.nonzero(contact[:, n])[0]
+            nxt[nxt[:, n] < 0, n] = c[-1] if len(c) else T - 1
+        self.next_frame = torch.tensor(nxt, device=env.device)  # [T, N]
+        self.next_pos = holds[hold_id.gather(0, self.next_frame)]  # [T, N, 3], env frame
+        self.future = torch.tensor(cfg.params["offsets"], device=env.device)  # [K]
+        self.step_dt = env.step_dt
+
+    def __call__(
+        self,
+        env: ManagerBasedRlEnv,
+        command_name: str,
+        site_names: tuple[str, ...],
+        offsets: tuple[int, ...],
+        hold_positions: tuple[tuple[float, float, float], ...],
+        threshold: float = 0.003,
+        max_time: float = 1.0,
+        asset_name: str = "robot",
+    ) -> torch.Tensor:
+        command = cast(MotionCommand, env.command_manager.get_term(command_name))
+        t = command.time_steps
+        B = t.shape[0]
+        idx = torch.clamp(t[:, None] + self.future, max=self.contact.shape[0] - 1)  # [B, K]
+        now = self.contact[t].float()  # [B, N]
+        future = self.contact[idx].float().reshape(B, -1)  # [B, K * N]
+        next_pos_w = self.next_pos[t] + env.scene.env_origins[:, None]  # [B, N, 3]
+        q_inv = quat_inv(command.robot_anchor_quat_w)[:, None].expand(-1, next_pos_w.shape[1], -1)
+        next_pos_b = quat_apply(q_inv, next_pos_w - command.robot_anchor_pos_w[:, None]).reshape(B, -1)
+        time_to = torch.clamp((self.next_frame[t] - t[:, None]).clamp(min=0) * self.step_dt, max=max_time)
+        return torch.cat([now, future, next_pos_b, time_to], dim=-1)
+
+
+class motion_tracking_errors_b:
+    """Reference minus robot, in the robot's trunk frame: ball positions (N * 3) and trunk position (3)."""
+
+    def __init__(self, cfg, env: ManagerBasedRlEnv):
+        command = cast(MotionCommand, env.command_manager.get_term(cfg.params["command_name"]))
+        asset_name = cfg.params.get("asset_name", "robot")
+        site_names = tuple(cfg.params["site_names"])
+        self.cmd_body_idx, self.offsets = _ball_site_offsets(env, command, site_names, asset_name)
+        self.site_ids = env.scene[asset_name].find_sites(site_names, preserve_order=True)[0]
+
+    def __call__(
+        self, env: ManagerBasedRlEnv, command_name: str, site_names: tuple[str, ...], asset_name: str = "robot"
+    ) -> torch.Tensor:
+        command = cast(MotionCommand, env.command_manager.get_term(command_name))
+        asset: Entity = env.scene[asset_name]
+        body_pos = command.body_pos_w[:, self.cmd_body_idx]
+        body_quat = command.body_quat_w[:, self.cmd_body_idx]
+        ref_ball = body_pos + quat_apply(body_quat, self.offsets.expand(body_pos.shape[0], -1, -1))  # [B, N, 3]
+        ball_err_w = ref_ball - asset.data.site_pos_w[:, self.site_ids]
+        root_err_w = (command.anchor_pos_w - command.robot_anchor_pos_w)[:, None]  # [B, 1, 3]
+        err_w = torch.cat([ball_err_w, root_err_w], dim=1)
+        q_inv = quat_inv(command.robot_anchor_quat_w)[:, None].expand(-1, err_w.shape[1], -1)
+        return quat_apply(q_inv, err_w).reshape(err_w.shape[0], -1)
+
+
+def applied_joint_torques(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG) -> torch.Tensor:
+    """Torques applied by the actuators [Nm]."""
+    asset: Entity = env.scene[asset_cfg.name]
+    return asset.data.actuator_force
+
+
+def motion_future_joint_pos(
+    env: ManagerBasedRlEnv,
+    command_name: str,
+    num_steps: int = 20,
+    stride: int = 1,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Future reference joint configurations: frames t+stride, ..., t+num_steps*stride of the motion.
+
+    Joint positions are relative to the default joint positions (as the joint_pos observation), and
+    frames past the end of the motion are clamped to its last frame. Shape [B, num_steps * num_joints].
+    """
+    command = cast(MotionCommand, env.command_manager.get_term(command_name))
+    asset: Entity = env.scene[asset_cfg.name]
+    motion = command.motion
+    future = torch.arange(1, num_steps + 1, device=env.device) * stride  # [K]
+    idx = torch.clamp(command.time_steps[:, None] + future, max=motion.time_step_total - 1)  # [B, K]
+    joint_pos = motion.joint_pos[idx] - asset.data.default_joint_pos[:, None]  # [B, K, J]
+    return joint_pos.reshape(joint_pos.shape[0], -1)
 
 
 @dataclass(kw_only=True)
