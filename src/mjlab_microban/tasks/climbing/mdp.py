@@ -572,6 +572,23 @@ def _dr_ramp(step: int, hold_steps: int, full_steps: int) -> float:
     return min(max((step - hold_steps) / max(full_steps - hold_steps, 1), 0.0), 1.0)
 
 
+class reward_weight_ramp:
+    """Curriculum on a reward term's weight: 0 up to ``hold_steps`` env steps, then linear to the term's configured
+    weight at ``full_steps`` (_dr_ramp)."""
+
+    def __init__(self, cfg, env: ManagerBasedRlEnv):
+        self.term_cfg = env.reward_manager.get_term_cfg(cfg.params["term_name"])
+        self.full_weight = self.term_cfg.weight
+        self.term_cfg.weight = 0.0
+
+    def __call__(
+        self, env: ManagerBasedRlEnv, env_ids: torch.Tensor, term_name: str, hold_steps: int, full_steps: int
+    ) -> dict[str, float]:
+        del env_ids, term_name
+        self.term_cfg.weight = _dr_ramp(env.common_step_counter, hold_steps, full_steps) * self.full_weight
+        return {"weight": self.term_cfg.weight}
+
+
 class actuator_dr_curriculum:
     """Curriculum on the actuator domain randomisation: BAM joint friction and battery voltage.
 
@@ -1049,6 +1066,54 @@ class ball_in_hold_contact:
         log["Metrics/ball_in_hold_seated_when_expected"] = (rewarded.float().sum() / expected.float().sum().clamp(min=1))
         log["Metrics/ball_on_hold_top"] = per_ball(wall_top).float().mean()
         return rewarded.float().sum(dim=-1)
+
+
+class robot_stuck:
+    """1 while the robot has been stuck for longer than ``max_time`` [s], else 0.
+
+    The robot is stuck while its trunk (root) and its balls (``site_names``) all stay within ``distance`` [m] of
+    where they were when it last moved: any of them moving farther restarts the clock from the new pose. So a
+    climb where one limb moves at a time is not stuck, a robot hanging still on its holds is. The clock is
+    restarted on resets and held at 0 once the env's reference is on the last frame of its motion (nothing left
+    to climb).
+    """
+
+    def __init__(self, cfg, env: ManagerBasedRlEnv):
+        asset: Entity = env.scene[cfg.params.get("asset_name", "robot")]
+        self.site_ids = asset.find_sites(tuple(cfg.params["site_names"]), preserve_order=True)[0]
+        self.anchor = torch.zeros(env.num_envs, len(self.site_ids) + 1, 3, device=env.device)
+        self.stuck_time = torch.zeros(env.num_envs, device=env.device)
+        self.needs_anchor = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+        self.step_dt = env.step_dt
+
+    def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+        env_ids = slice(None) if env_ids is None else env_ids
+        self.stuck_time[env_ids] = 0.0
+        self.needs_anchor[env_ids] = True  # the pose after the reset is only known at the next step
+
+    def __call__(
+        self,
+        env: ManagerBasedRlEnv,
+        command_name: str,
+        site_names: tuple[str, ...],
+        distance: float = 0.03,
+        max_time: float = 2.0,
+        asset_name: str = "robot",
+    ) -> torch.Tensor:
+        asset: Entity = env.scene[asset_name]
+        points = torch.cat([asset.data.root_link_pos_w[:, None], asset.data.site_pos_w[:, self.site_ids]], dim=1)
+        moved = (points - self.anchor).norm(dim=-1).amax(dim=-1) > distance
+        restart = moved | self.needs_anchor
+        command = cast(MotionCommand, env.command_manager.get_term(command_name))
+        restart |= command.time_steps >= _motion_last_frame(command)
+        self.anchor[restart] = points[restart]
+        self.needs_anchor[:] = False
+        self.stuck_time = torch.where(restart, torch.zeros_like(self.stuck_time), self.stuck_time + self.step_dt)
+
+        stuck = (self.stuck_time > max_time).float()
+        env.extras["log"]["Metrics/robot_stuck_frac"] = stuck.mean()
+        env.extras["log"]["Metrics/robot_stuck_time_mean"] = self.stuck_time.mean()
+        return stuck
 
 
 def applied_joint_torques(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG) -> torch.Tensor:

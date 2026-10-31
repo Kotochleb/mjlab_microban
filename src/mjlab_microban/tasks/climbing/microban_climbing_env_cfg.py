@@ -141,6 +141,10 @@ def _robot_spec_fn(get_spec, trunk_pos):
 TRACKED_BODY_NAMES = ("trunk",) + END_EFFECTOR_BODY_NAMES + ("head",)
 # Contact slots per ball / capsule of the grip_hold_contact sensor (its strongest contacts with the wall).
 GRIP_HOLD_CONTACT_SLOTS = 3
+# robot_stuck penalty: stuck when the trunk and the four balls all stay within STUCK_DISTANCE [m] of where they
+# last were for longer than STUCK_MAX_TIME [s].
+STUCK_DISTANCE = 0.03
+STUCK_MAX_TIME = 2.0
 # Contact slots per ball of the ball_hold_contact sensor (a seated ball touches the floor and up to two walls).
 BALL_HOLD_CONTACT_SLOTS = 3
 # Policy steps before and after the current one on which the reference has to expect a ball on a hold for
@@ -392,6 +396,19 @@ def make_microban_climbing_env_cfg(
             weight=-0.05,
             params={"threshold": TORQUE_BARRIER_THRESHOLD, "sharpness": TORQUE_BARRIER_SHARPNESS},
         ),
+        # Penalty while the robot has not moved (trunk and balls all within STUCK_DISTANCE of where they last were)
+        # for longer than STUCK_MAX_TIME, until the end of its motion. Its weight is ramped up by a curriculum
+        # (robot_stuck_weight) in training.
+        "robot_stuck": RewardTermCfg(
+            func=mdp.robot_stuck,
+            weight=-1.0,
+            params={
+                "command_name": "motion",
+                "site_names": BALL_SITE_NAMES,
+                "distance": STUCK_DISTANCE,
+                "max_time": STUCK_MAX_TIME,
+            },
+        ),
         # Small penalty per ball (hand / foot sphere) touching a 1-box block, i.e. a hold the motion does not use.
         "ball_on_unused_hold": RewardTermCfg(
             func=mdp.contact_count,
@@ -448,10 +465,10 @@ def make_microban_climbing_env_cfg(
     )
 
     # The balls and capsules are what touches the holds: randomise their friction (the feet's in the tracking
-    # task), sliding coefficient U(0.1, 0.5), shared by all of them in an env. They have priority 1, so this is
+    # task), sliding coefficient U(0.01, 0.5), shared by all of them in an env. They have priority 1, so this is
     # the friction of their contacts with the holds (and with the board / floor), not the holds' HOLD_FRICTION.
     cfg.events["foot_friction"].params["asset_cfg"].geom_names = GRIP_GEOM_NAMES
-    cfg.events["foot_friction"].params["ranges"] = (0.1, 0.5)
+    cfg.events["foot_friction"].params["ranges"] = (0.01, 0.5)
 
     cfg.events["base_com"].params["asset_cfg"].body_names = ("trunk",)
     cfg.events["base_com"].params["ranges"] = {
@@ -552,6 +569,12 @@ def make_microban_climbing_env_cfg(
                 "hold_steps": 500 * 24,
                 "full_steps": 1500 * 24,
             },
+        )
+        # robot_stuck penalty: off up to iteration 200, then its weight rises linearly from 0 to the full one at
+        # iteration 700.
+        cfg.curriculum["robot_stuck_weight"] = CurriculumTermCfg(
+            func=mdp.reward_weight_ramp,
+            params={"term_name": "robot_stuck", "hold_steps": 200 * 24, "full_steps": 700 * 24},
         )
         cfg.curriculum["bam_power"] = CurriculumTermCfg(
             func=mdp.bam_power_curriculum,

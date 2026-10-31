@@ -76,6 +76,13 @@
 #                           start holds, rope on. Then, in the dashboard, start "climb_policy": the joints ramp to the
 #                           climb's first pose (2 s), hold it (2 s), and the policy climbs; stop it to end
 #                           (it holds 5 s, then the torque goes off). Its log: H:~/climb_logs/
+#                           Done by the workshop's scripts/robot_climb_policy.py (as sim_check_climb_policy.py
+#                           in the sim): it asks before starting, then stops the move after --seconds S of
+#                           climbing (default 60); --view shows the robot live in MuJoCo's viewer
+#   --offline               no W&B (no internet): the checkpoint downloaded before, in
+#                           logs/rsl_rl/<experiment>/wandb_checkpoints/<run_id>, and the run's motion cached
+#                           there (W&B unreachable: the same, by itself). A bundle already exported from the
+#                           same checkpoint and motion, its check passed, is reused (no export)
 #   In play, --num-envs defaults to 1 and the variant flags have to match the run's (--policy, --multi-board /
 #   --boards-file). The wall's motion .npz is selected automatically when not given: the one the run was trained
 #   on (its params/env.yaml, or the W&B run's config), found by its path, else by its file name under
@@ -133,6 +140,9 @@ CHECK_STEPS=500
 SIM_CHECK=false
 SIM_SECONDS=30
 ROBOT_HOST=""
+ROBOT_VIEW=false
+ROBOT_SECONDS=60
+OFFLINE=false
 
 need_value() { [[ $2 -ge 2 ]] || { echo "$1 needs a value" >&2; exit 1; }; }
 
@@ -173,6 +183,10 @@ while [[ $# -gt 0 ]]; do
     --sim-check) DEPLOY=true; PLAY=true; SIM_CHECK=true; shift ;;
     --sim-seconds) need_value "$1" $#; SIM_SECONDS="$2"; shift 2 ;;
     --sim-seconds=*) SIM_SECONDS="${1#*=}"; shift ;;
+    --view) ROBOT_VIEW=true; shift ;;
+    --seconds) need_value "$1" $#; ROBOT_SECONDS="$2"; shift 2 ;;
+    --seconds=*) ROBOT_SECONDS="${1#*=}"; shift ;;
+    --offline) OFFLINE=true; shift ;;
     --host) need_value "$1" $#; DEPLOY=true; PLAY=true; ROBOT_HOST="$2"; shift 2 ;;
     --host=*) DEPLOY=true; PLAY=true; ROBOT_HOST="${1#*=}"; shift ;;
     *) ARGS+=("$1"); shift ;;
@@ -287,11 +301,14 @@ deploy() {
   local export_cmd=(uv run python src/mjlab_microban/scripts/export_climbing_deploy.py --task "$TASK" "${src[@]}"
     --motion-file "$MOTION_FILE" --check-steps "$CHECK_STEPS")
   [[ -n "$out" ]] && export_cmd+=(--out "$out")
+  $OFFLINE && export_cmd+=(--offline)
+  local robot_cmd=("$ws_python" "$ws/scripts/robot_climb_policy.py" "<bundle>" --host "$ROBOT_HOST"
+    --seconds "$ROBOT_SECONDS" --microban "$microban")
+  $ROBOT_VIEW && robot_cmd+=(--view)
   if $DRY_RUN; then
     printf 'RCR_SRC=%q ' "$ws/src"; printf '%q ' "${export_cmd[@]}"; echo
     $SIM_CHECK && echo "$ws_python $ws/scripts/sim_check_climb_policy.py <bundle> --seconds $SIM_SECONDS"
-    [[ -n "$ROBOT_HOST" ]] && echo "$ws_python $ws/scripts/link_pi.py deploy $ROBOT_HOST" \
-      && echo "rsync <bundle>/ $ROBOT_HOST:climb_policy/ && make -C $microban run HOST=$ROBOT_HOST MOVES=$move"
+    [[ -n "$ROBOT_HOST" ]] && { printf '%q ' "${robot_cmd[@]}"; echo; }
     return 0
   fi
   echo "[INFO] Exporting $CHECKPOINT ($TASK) on $MOTION_FILE for the robot"
@@ -312,14 +329,9 @@ deploy() {
   fi
 
   if [[ -n "$ROBOT_HOST" ]]; then
-    [[ -f "$microban/Makefile" ]] || { echo "Microban not found at $microban (set MICROBAN)" >&2; exit 1; }
-    echo "[INFO] Our Pi code (rcr: controller, ...) to $ROBOT_HOST:~/rcr/src"
-    "$ws_python" "$ws/scripts/link_pi.py" deploy "$ROBOT_HOST" || { echo "[ERROR] copy of our code failed" >&2; exit 1; }
-    echo "[INFO] The bundle to $ROBOT_HOST:~/climb_policy"
-    rsync -av --delete --exclude parity.npz --exclude sim_check.npz --exclude __pycache__ "$out/" "$ROBOT_HOST:climb_policy/"
-    echo "[INFO] The robot's program with the climb_policy move (make run in $microban): robot on the wall, rope on;"
-    echo "       start the move from the dashboard, stop it to end (Ctrl+C here: the program stops, torque off)"
-    exec make -C "$microban" run HOST="$ROBOT_HOST" MOVES="$move"
+    robot_cmd[2]="$out"
+    echo "[INFO] On the robot: ${robot_cmd[*]}"
+    exec "${robot_cmd[@]}"
   else
     echo "[INFO] Bundle ready: $out"
     echo "       on the robot: $0 --deploy ... --host <robot>"
@@ -408,8 +420,16 @@ print(b.get('motion', f\"multi_board/l{b['level']}s{b['seed']}.npz\"))
   else
     # The motion (and so the wall): the command line's, else the one the run was trained on.
     if [[ -n "$WANDB_RUN" ]]; then
+      # The run's motion, cached next to its downloaded checkpoints (for --offline / no internet).
+      MOTION_CACHE=""
+      if EXP="$(experiment_name "$TASK")"; then
+        MOTION_CACHE="$REPO_ROOT/logs/rsl_rl/$EXP/wandb_checkpoints/${WANDB_RUN##*/}/motion_file.txt"
+      fi
+      if $OFFLINE; then
+        RUN_MOTION="$(cat "$MOTION_CACHE" 2>/dev/null || true)"
+      else
       # rsl_rl logs the env cfg to the W&B run's config (env_cfg).
-      RUN_MOTION="$(uv run python -c "
+      RUN_MOTION="$(WANDB_HTTP_TIMEOUT="${WANDB_HTTP_TIMEOUT:-20}" uv run python -c "
 import sys, wandb
 try:
     cfg = wandb.Api().run(sys.argv[1]).config['env_cfg']
@@ -418,6 +438,13 @@ try:
 except Exception as e:
     print(f'[WARN] No motion in the config of W&B run {sys.argv[1]}: {e!r}', file=sys.stderr)
 " "$WANDB_RUN" || true)"
+        if [[ -n "$RUN_MOTION" && -n "$MOTION_CACHE" ]]; then
+          mkdir -p "$(dirname "$MOTION_CACHE")" && echo "$RUN_MOTION" > "$MOTION_CACHE"
+        elif [[ -z "$RUN_MOTION" && -f "$MOTION_CACHE" ]]; then
+          RUN_MOTION="$(cat "$MOTION_CACHE")"
+          echo "[INFO] W&B unreachable: the run's cached motion $RUN_MOTION"
+        fi
+      fi
     else
       RUN_MOTION="$(uv run python -c "
 import sys, yaml

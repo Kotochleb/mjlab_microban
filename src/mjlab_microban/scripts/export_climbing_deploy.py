@@ -53,6 +53,10 @@ def parse_args() -> argparse.Namespace:
                         "to a hold socket (default 0.005)")
     p.add_argument("--check-steps", type=int, default=500, help="ticks of the parity check (0: none)")
     p.add_argument("--device", default="cpu")
+    p.add_argument("--offline", action="store_true",
+                   help="no W&B: the checkpoint downloaded before (logs/rsl_rl/<experiment>/wandb_checkpoints/<run>)")
+    p.add_argument("--force", action="store_true",
+                   help="rebuild the bundle even if one of this checkpoint and motion passed its check already")
     return p.parse_args()
 
 
@@ -64,10 +68,52 @@ def resolve_checkpoint(args, task: str) -> Path:
     from mjlab.tasks.registry import load_rl_cfg
     from mjlab.utils.os import get_wandb_checkpoint_path
 
-    log_root = Path("logs/rsl_rl") / load_rl_cfg(task).experiment_name
-    path, cached = get_wandb_checkpoint_path(log_root.resolve(), Path(args.wandb_run_path), args.wandb_checkpoint_name)
-    print(f"[INFO] checkpoint {path.name} of W&B run {args.wandb_run_path} ({'cached' if cached else 'downloaded'})")
+    log_root = (Path("logs/rsl_rl") / load_rl_cfg(task).experiment_name).resolve()
+    if not args.offline:
+        os.environ.setdefault("WANDB_HTTP_TIMEOUT", "20")  # no internet: fail fast, then the cache
+        try:
+            path, cached = get_wandb_checkpoint_path(log_root, Path(args.wandb_run_path), args.wandb_checkpoint_name)
+            print(f"[INFO] checkpoint {path.name} of W&B run {args.wandb_run_path} "
+                  f"({'cached' if cached else 'downloaded'})")
+            return path
+        except Exception as e:  # noqa: BLE001  (no network, no API key, W&B down: the cache)
+            print(f"[WARN] W&B unreachable ({type(e).__name__}: {str(e)[:120]}): the cached checkpoint")
+    path = cached_checkpoint(log_root, args.wandb_run_path, args.wandb_checkpoint_name)
+    if path is None:
+        sys.exit(f"no cached checkpoint of W&B run {args.wandb_run_path} in {log_root / 'wandb_checkpoints'}: "
+                 "run once with internet (it is downloaded and kept there)")
+    newest = "" if args.wandb_checkpoint_name else ": the newest one downloaded, maybe not the run's latest"
+    print(f"[INFO] checkpoint {path.name} of W&B run {args.wandb_run_path} (cached, offline{newest})")
     return path
+
+
+def cached_checkpoint(log_root: Path, run_path: str, name: str | None) -> Path | None:
+    """A checkpoint of a W&B run downloaded before (mjlab keeps them in wandb_checkpoints/<run id>)."""
+    folder = log_root / "wandb_checkpoints" / str(run_path).rstrip("/").split("/")[-1]
+    if name:
+        return folder / name if (folder / name).is_file() else None
+
+    def iteration(p: Path) -> int:
+        it = p.stem.removeprefix("model_")
+        return int(it) if it.isdigit() else -1
+
+    return max(folder.glob("model_*.pt"), key=iteration, default=None)
+
+
+def cached_bundle(out: Path, task: str, checkpoint: Path, motion_file: Path, fmt: int) -> bool:
+    """A bundle of this checkpoint and motion is in out, of this format, and passed its check: kept."""
+    try:
+        info = json.loads((out / "info.json").read_text())
+    except (OSError, ValueError):
+        return False
+    files = all((out / f).is_file() for f in ("climb_bundle.npz", "policy.onnx", "wall.json"))
+    same = (info.get("task") == task and info.get("checkpoint") == str(checkpoint)
+            and info.get("motion_file") == str(motion_file) and info.get("format") == fmt)
+    if files and same and info.get("parity") == "passed":
+        print(f"[INFO] cached bundle: same checkpoint, motion and format, its check passed "
+              f"({info.get('parity_ticks')} ticks); --force rebuilds it")
+        return True
+    return False
 
 
 def actor_layout(env) -> list[tuple[str, int, int]]:
@@ -190,6 +236,9 @@ def main() -> None:
     checkpoint = resolve_checkpoint(args, task)
     out = args.out or Path("logs/deploy") / f"{checkpoint.parent.name}_{checkpoint.stem}"
     out.mkdir(parents=True, exist_ok=True)
+    if not args.force and cached_bundle(out, task, checkpoint, motion_file, move_mod.BUNDLE_FORMAT):
+        print(f"[INFO] bundle: {out.resolve()}")
+        return
 
     env_cfg = load_env_cfg(task, play=True)
     env_cfg.scene.num_envs = 1
@@ -276,8 +325,9 @@ def main() -> None:
     np.savez(out / "climb_bundle.npz", **bundle)
     export_onnx(runner, out / "policy.onnx")
     sim_wall(wall).to_json(out / "wall.json")
-    (out / "info.json").write_text(json.dumps({k: bundle[k] for k in ("task", "checkpoint", "motion_file", "wall",
-                                                                         "kp_fw")}, indent=2))
+    info = {k: bundle[k] for k in ("task", "checkpoint", "motion_file", "wall", "kp_fw", "format")}
+    info["parity"] = "pending"  # not reusable until the check below passes
+    (out / "info.json").write_text(json.dumps(info, indent=2))
     fk_err = check_kinematics(env, bundle, joint_names, BALL_SITE_NAMES, move_mod)
     print(f"[INFO] forward kinematics of the move vs MuJoCo: {fk_err * 1e3:.4f} mm max")
     if fk_err > 1e-5:
@@ -286,6 +336,9 @@ def main() -> None:
     ok = True
     if args.check_steps > 0:
         ok = parity_check(args, env, wrapped, policy, command, robot, move_mod, out, layout, has_phase)
+    info["parity"] = ("passed" if ok else "failed") if args.check_steps > 0 else "skipped"
+    info["parity_ticks"] = args.check_steps
+    (out / "info.json").write_text(json.dumps(info, indent=2))
     env.close()
     print(f"[INFO] bundle: {out.resolve()}")
     if not ok:
