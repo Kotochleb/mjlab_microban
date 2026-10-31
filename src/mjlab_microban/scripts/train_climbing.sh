@@ -63,4 +63,5 @@ echo "[INFO] Training $TASK with $NUM_ENVS envs on $MOTION_FILE"
 exec uv run train "$TASK" \
     --env.scene.num-envs "$NUM_ENVS" \
     --env.commands.motion.motion-file "$MOTION_FILE" \
+    --video True \
     "$@"
