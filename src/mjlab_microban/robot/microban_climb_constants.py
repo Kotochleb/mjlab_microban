@@ -34,6 +34,10 @@ BALL_SITE_NAMES = ("left_hand_ball", "right_hand_ball", "left_foot_ball", "right
 # Capsules on the hand balls; like the balls, they can reach the inside of the 5-box cups (handles group).
 HAND_CAPSULE_GEOM_NAMES = ("left_hand_capsule_coll", "right_hand_capsule_coll")
 HANDLE_GEOM_NAMES = BALL_GEOM_NAMES + HAND_CAPSULE_GEOM_NAMES
+# Capsules above the foot balls (contype WORLD: they touch the 1-box blocks and the 5-box cup lips).
+FOOT_CAPSULE_GEOM_NAMES = ("left_foot_ball_capsule_coll", "right_foot_ball_capsule_coll")
+# The end-effector geoms that grip the holds: their friction (priority 1) sets that of their contacts.
+GRIP_GEOM_NAMES = BALL_GEOM_NAMES + HAND_CAPSULE_GEOM_NAMES + FOOT_CAPSULE_GEOM_NAMES
 HANDS_BODY_NAMES = ("radius_left", "radius_right")
 FEET_BODY_NAMES = ("foot_climb_2", "foot_climb")  # left, right
 
@@ -62,7 +66,8 @@ def get_spec() -> mujoco.MjSpec:
     trunk.quat = CLIMB_START_FRAME.rot
 
     for geom in spec.geoms:
-        if geom.name in BALL_GEOM_NAMES:
+        # Priority 1 > the wall's 0: the contacts with the holds use these geoms' (randomised) friction.
+        if geom.name in GRIP_GEOM_NAMES:
             geom.condim = 3
             geom.priority = 1
             geom.friction[0] = 1.0
@@ -106,7 +111,7 @@ actuators = BamActuatorCfg(
     model="m6",
     target_names_expr=(r".*",),
     kp_fw=125,
-    vin_range=(7.0, 8.0),
+    vin_range=(7.0, 9.0),  # training: narrowed then widened by the actuator_dr curriculum
     vin_drop_gain_range=(0.0, 0.2),
     vin_min=6.0,
     max_current=1.75,

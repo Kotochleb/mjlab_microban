@@ -22,6 +22,11 @@
 #       conv1d-history  as conv1d, plus a 0.5 s history of the actor's proprioception, also encoded by 1D
 #                       convolutions (tasks/climbing/microban_climbing_conv1d_history_env_cfg.py).
 #   --conv1d, --conv1d-history   shorthands for --policy conv1d / --policy conv1d-history
+#   --multi-board           train on several boards at once with a curriculum over their levels
+#                           (Mjlab-Climbing-Microban-Multi-Board[-Conv1d|-Conv1d-History]): the boards and their
+#                           motions come from a board file, not from a motion file argument
+#   --boards-file F         the board file of --multi-board (default: tasks/climbing/boards/multi_board.json);
+#                           make its motions first with src/mjlab_microban/scripts/make_multi_board_motions.py
 # Run flags:
 #   --num-envs N            number of parallel environments (default: 4096, or $NUM_ENVS)
 #   --no-video              do not record training videos
@@ -44,6 +49,7 @@
 #   src/mjlab_microban/scripts/train_climbing.sh src/mjlab_microban/motion/l1s0_q.npz --agent.max-iterations 10000
 #   src/mjlab_microban/scripts/train_climbing.sh --conv1d-history src/mjlab_microban/motion/l1s0.npz
 #   src/mjlab_microban/scripts/train_climbing.sh --conv1d --num-envs 2048 --no-video
+#   src/mjlab_microban/scripts/train_climbing.sh --multi-board --conv1d-history
 
 set -euo pipefail
 
@@ -53,6 +59,7 @@ NUM_ENVS="${NUM_ENVS:-4096}"
 VIDEO="${VIDEO:-True}"
 POLICY="${POLICY:-mlp}"
 DRY_RUN=false
+MULTI_BOARD=false
 POLICY_FLAG=false  # --policy given explicitly
 
 need_value() { [[ $2 -ge 2 ]] || { echo "$1 needs a value" >&2; exit 1; }; }
@@ -69,6 +76,9 @@ while [[ $# -gt 0 ]]; do
     --num-envs) need_value "$1" $#; NUM_ENVS="$2"; shift 2 ;;
     --num-envs=*) NUM_ENVS="${1#--num-envs=}"; shift ;;
     --no-video) VIDEO=False; shift ;;
+    --multi-board) MULTI_BOARD=true; shift ;;
+    --boards-file) need_value "$1" $#; MULTI_BOARD=true; export MICROBAN_BOARDS_FILE="$(realpath "$2")"; shift 2 ;;
+    --boards-file=*) MULTI_BOARD=true; export MICROBAN_BOARDS_FILE="$(realpath "${1#--boards-file=}")"; shift ;;
     --dry-run) DRY_RUN=true; shift ;;
     *) ARGS+=("$1"); shift ;;
   esac
@@ -90,13 +100,32 @@ if [[ -n "${TASK:-}" ]]; then
     exit 1
   fi
 else
-  TASK="Mjlab-Climbing-Microban$POLICY_SUFFIX"
+  if $MULTI_BOARD; then
+    TASK="Mjlab-Climbing-Microban-Multi-Board$POLICY_SUFFIX"
+  else
+    TASK="Mjlab-Climbing-Microban$POLICY_SUFFIX"
+  fi
 fi
 
 export MUJOCO_GL=egl
 
 # Run from the repository root so logs end up in logs/rsl_rl/.
 REPO_ROOT="$(cd "$(dirname "$(realpath "$0")")/../../.." && pwd)"
+
+if $MULTI_BOARD; then
+  if [[ $# -ge 1 && "$1" != -* ]]; then
+    echo "--multi-board takes its motions from the board file, not $1 (use --boards-file)" >&2
+    exit 1
+  fi
+  cd "$REPO_ROOT"
+  CMD=(uv run train "$TASK" --env.scene.num-envs "$NUM_ENVS" --video "$VIDEO" "$@")
+  echo "[INFO] Training $TASK with $NUM_ENVS envs on the boards of ${MICROBAN_BOARDS_FILE:-src/mjlab_microban/tasks/climbing/boards/multi_board.json}"
+  if $DRY_RUN; then
+    printf '%q ' "${CMD[@]}"; echo
+    exit 0
+  fi
+  exec "${CMD[@]}"
+fi
 
 if [[ $# -ge 1 && "$1" != -* ]]; then
   MOTION_FILE="$(realpath "$1")"

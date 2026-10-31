@@ -223,6 +223,126 @@ def motion_global_anchor_position_z_error_exp(
     return torch.exp(-error / std**2)
 
 
+# ---------------------------------------------------------------------------------------------------------
+# Motion speed (time scaling of the reference)
+# ---------------------------------------------------------------------------------------------------------
+
+
+_PHASE_EPS = 1e-4  # float32 round-off on the accumulated phase (e.g. 40 * 0.9 = 35.99999)
+
+
+def _motion_last_frame(command: MotionCommand) -> torch.Tensor:
+    """Last frame each env may read, shape [B]: the end of its own board's segment for a MultiBoardMotionCommand
+    (its padding repeats that frame), the end of the motion otherwise."""
+    if hasattr(command, "segment_start") and hasattr(command, "board_ids"):
+        board = command.board_ids
+        return command.segment_start[board] + command.segment_length[board] - 1
+    return torch.full_like(command.time_steps, command.motion.time_step_total - 1)
+
+
+def motion_frames_ahead(command: MotionCommand, offsets: torch.Tensor) -> torch.Tensor:
+    """Motion frames ``offsets`` env steps ahead of the current one, shape [B, K], clamped to the last frame.
+
+    With motion_speed_curriculum, env steps are ``speed`` motion frames (from the env's fractional phase), so the
+    look-ahead covers the same time as the motion the env will actually be given; otherwise frames t + offsets.
+    """
+    t = command.time_steps
+    speed = getattr(command, "speed", None)
+    if speed is None:
+        idx = t[:, None] + offsets
+    else:
+        frac = command.phase - t.float()
+        frac = torch.where((frac >= -_PHASE_EPS) & (frac < 1.0), frac, torch.zeros_like(frac))  # 0 if just resampled
+        idx = t[:, None] + torch.floor(frac[:, None] + speed[:, None] * offsets + _PHASE_EPS).long()
+    return torch.minimum(idx, _motion_last_frame(command)[:, None])
+
+
+class _TimeScaledMotionCommand:
+    """Mixin put in front of a motion command's class by enable_motion_speed: each env plays the motion at its
+    own ``speed`` (motion frames per env step, [B]) from a fractional ``phase`` ([B]); ``time_steps`` is its floor.
+    Reference velocities are scaled by the speed, so they match the time-scaled motion (rewards, observations
+    and the reference state written on resets)."""
+
+    speed: torch.Tensor
+    phase: torch.Tensor
+
+    @property
+    def joint_vel(self) -> torch.Tensor:
+        return super().joint_vel * self.speed[:, None]
+
+    @property
+    def body_lin_vel_w(self) -> torch.Tensor:
+        return super().body_lin_vel_w * self.speed[:, None, None]
+
+    @property
+    def body_ang_vel_w(self) -> torch.Tensor:
+        return super().body_ang_vel_w * self.speed[:, None, None]
+
+    @property
+    def anchor_lin_vel_w(self) -> torch.Tensor:
+        return super().anchor_lin_vel_w * self.speed[:, None]
+
+    @property
+    def anchor_ang_vel_w(self) -> torch.Tensor:
+        return super().anchor_ang_vel_w * self.speed[:, None]
+
+    def _update_command(self):
+        # time_steps set elsewhere (resampling, reset_to_frame, the viewer's scrubber): restart the phase there.
+        frac = self.phase - self.time_steps.float()
+        in_sync = (frac >= -_PHASE_EPS) & (frac < 1.0)
+        self.phase = torch.where(in_sync, self.phase, self.time_steps.float()) + self.speed
+        # The base class advances time_steps by one frame and handles the end of the motion.
+        self.time_steps[:] = torch.floor(self.phase + _PHASE_EPS).long() - 1
+        super()._update_command()
+
+
+def enable_motion_speed(command: MotionCommand) -> MotionCommand:
+    """Make a motion command (MotionCommand or a subclass) play the motion at a per-env speed, 1 by default."""
+    if not isinstance(command, _TimeScaledMotionCommand):
+        cls = type(command)
+        command.__class__ = type(f"TimeScaled{cls.__name__}", (_TimeScaledMotionCommand, cls), {})
+        command.speed = torch.ones(command.num_envs, device=command.device)
+        command.phase = command.time_steps.float()
+    return command
+
+
+class motion_speed_curriculum:
+    """Curriculum on the speed of the reference motion: every env plays it at a speed drawn uniformly from
+    [lo, hi] on each of its resets (fixed during the episode).
+
+    [lo, hi] is ``start_range`` up to ``hold_steps`` env steps, then both bounds move linearly to ``full_range``
+    at ``full_steps``. Curriculum terms run before the command is reset, so the reference state an env is reset
+    to already has its new speed's velocities.
+    """
+
+    def __init__(self, cfg, env: ManagerBasedRlEnv):
+        command = cast(MotionCommand, env.command_manager.get_term(cfg.params["command_name"]))
+        self._command = enable_motion_speed(command)
+        lo, hi = cfg.params["start_range"]
+        self._command.speed.uniform_(lo, hi)
+
+    def __call__(
+        self,
+        env: ManagerBasedRlEnv,
+        env_ids: torch.Tensor | slice,
+        command_name: str,
+        start_range: tuple[float, float],
+        full_range: tuple[float, float],
+        hold_steps: int,
+        full_steps: int,
+    ) -> dict[str, float]:
+        del command_name
+        alpha = _dr_ramp(env.common_step_counter, hold_steps, full_steps)
+        lo = start_range[0] + alpha * (full_range[0] - start_range[0])
+        hi = start_range[1] + alpha * (full_range[1] - start_range[1])
+        speed = self._command.speed
+        if isinstance(env_ids, slice):
+            speed[env_ids] = torch.empty_like(speed[env_ids]).uniform_(lo, hi)
+        elif env_ids.numel() > 0:
+            speed[env_ids] = torch.empty(env_ids.numel(), device=speed.device).uniform_(lo, hi)
+        return {"progress": alpha, "speed_min": lo, "speed_max": hi, "speed_mean": float(speed.mean())}
+
+
 class motion_future_window:
     """Rolling window over future frames of the reference motion.
 
@@ -259,7 +379,7 @@ class motion_future_window:
 
         # Env origins cancel out in the relative poses, so the raw motion frames are used.
         t = command.time_steps
-        idx = torch.clamp(t[:, None] + self.future, max=motion.time_step_total - 1)  # [B, K]
+        idx = motion_frames_ahead(command, self.future)  # [B, K]
 
         ref_pos = motion.body_pos_w[t, anchor][:, None]  # [B, 1, 3]
         ref_quat_inv = quat_inv(motion.body_quat_w[t, anchor])[:, None]  # [B, 1, 4]
@@ -391,6 +511,8 @@ class bam_power_curriculum:
         for act, vin_final, max_current_final in zip(
             self._acts, self._vin_final, self._max_current_final, strict=True
         ):
+            # The realistic voltage follows actuator_dr_curriculum when it is used (it must run before this term).
+            vin_final = getattr(act, "vin_realistic", vin_final)
             act.vin_tensor[:] = vin_start + alpha * (vin_final - vin_start)
             if max_current_final is not None:
                 act.cfg.max_current = max_current_start + alpha * (max_current_final - max_current_start)
@@ -400,6 +522,128 @@ class bam_power_curriculum:
             "vin_mean": float(act.vin_tensor.mean()),
             "max_current": float(act.cfg.max_current) if act.cfg.max_current is not None else float("nan"),
         }
+
+
+def _install_bam_friction_scale(act: BamActuator, env: ManagerBasedRlEnv) -> torch.Tensor:
+    """Give a BAM actuator a per-env, per-joint friction scale ``act.friction_scale`` [B, J] (ones by default).
+
+    BAM zeroes MuJoCo's frictionloss / damping and computes the joint friction itself, so dof_frictionloss
+    randomisation has no effect on it. The scale multiplies BAM's whole friction budget (Coulomb, Stribeck,
+    load-dependent and viscous terms) by wrapping the instance's _compute_friction_budget.
+    """
+    if getattr(act, "friction_scale", None) is not None:
+        return act.friction_scale
+    dof_ids = act._dof_ids
+    act.friction_scale = torch.ones(env.num_envs, len(dof_ids), device=env.device)
+    viscous = float(act._bam_model.friction_viscous.value)
+    budget_fn = act._compute_friction_budget
+
+    def scaled_budget(motor_torque, external_torque, stribeck_coeff):
+        scale = act.friction_scale
+        budget = budget_fn(motor_torque, external_torque, stribeck_coeff)
+        # compute() adds viscous * |vel| after this call: add (scale - 1) of it here so all of it is scaled.
+        abs_vel = env.sim.data.qvel[:, dof_ids].abs()
+        return scale * budget + (scale - 1.0) * viscous * abs_vel
+
+    act._compute_friction_budget = scaled_budget
+    return act.friction_scale
+
+
+def _dr_ramp(step: int, hold_steps: int, full_steps: int) -> float:
+    """Progress in [0, 1] of the DR curricula: 0 up to ``hold_steps`` env steps, then linear to 1 at ``full_steps``."""
+    return min(max((step - hold_steps) / max(full_steps - hold_steps, 1), 0.0), 1.0)
+
+
+class actuator_dr_curriculum:
+    """Curriculum on the actuator domain randomisation: BAM joint friction and battery voltage.
+
+    Each env draws fixed unit noises u ~ U(-1, 1) at startup (one per joint for the friction, one per env for
+    the voltage); the randomised values are
+        friction scale = 1 + r_f(t) * u,    vin = vin_nominal * (1 + r_v(t) * u),
+    where the relative half-ranges r(t) stay at ``rel_start`` up to ``hold_steps`` env steps, then grow linearly
+    to their full values (``friction_rel_range``, ``vin_rel_range``) at ``full_steps``. Widening the range thus
+    moves every env further from nominal along its own direction instead of resampling it.
+
+    The voltage is written to ``act.vin_realistic`` and ``act.vin_tensor``; bam_power_curriculum (if any, listed
+    after this term) then interpolates from its boosted voltage to ``act.vin_realistic``.
+    """
+
+    def __init__(self, cfg, env: ManagerBasedRlEnv):
+        asset: Entity = env.scene[cfg.params.get("asset_cfg", _DEFAULT_ASSET_CFG).name]
+        self._acts = _bam_actuators(asset)
+        self._friction_u = []
+        self._vin_u = []
+        for act in self._acts:
+            scale = _install_bam_friction_scale(act, env)
+            self._friction_u.append(torch.empty_like(scale).uniform_(-1.0, 1.0))
+            self._vin_u.append(torch.empty_like(act.vin_tensor).uniform_(-1.0, 1.0))
+            act.vin_realistic = act.vin_tensor.clone()
+
+    def __call__(
+        self,
+        env: ManagerBasedRlEnv,
+        env_ids: torch.Tensor | slice,
+        vin_nominal: float,
+        vin_rel_range: float,
+        friction_rel_range: float,
+        rel_start: float,
+        hold_steps: int,
+        full_steps: int,
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    ) -> dict[str, float]:
+        del env_ids, asset_cfg
+        step = env.common_step_counter
+        alpha = _dr_ramp(step, hold_steps, full_steps)
+        friction_rel = rel_start + alpha * (friction_rel_range - rel_start)
+        vin_rel = rel_start + alpha * (vin_rel_range - rel_start)
+        for act, friction_u, vin_u in zip(self._acts, self._friction_u, self._vin_u, strict=True):
+            act.friction_scale[:] = 1.0 + friction_rel * friction_u
+            act.vin_realistic[:] = vin_nominal * (1.0 + vin_rel * vin_u)
+            act.vin_tensor[:] = act.vin_realistic
+        return {
+            "progress": alpha,
+            "friction_rel_range": friction_rel,
+            "vin_min": vin_nominal * (1.0 - vin_rel),
+            "vin_max": vin_nominal * (1.0 + vin_rel),
+        }
+
+
+class geom_pos_dr_curriculum:
+    """Curriculum on the position of some geoms (the ball spheres): per-env offsets in all three directions.
+
+    Each env and geom draws a fixed unit noise u ~ U(-1, 1)^3 at startup, and the geom (in its body frame) sits at
+        pos = default pos + r(t) * u,
+    where the half-range r(t) is ``start_frac * max_offset`` up to ``hold_steps`` env steps, then grows linearly
+    to ``max_offset`` [m] at ``full_steps``. Only the geoms move: the sites the rewards / observations use stay
+    at their nominal positions, like the robot's own model of itself.
+    """
+
+    def __init__(self, cfg, env: ManagerBasedRlEnv):
+        asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
+        asset_cfg.resolve(env.scene)
+        asset: Entity = env.scene[asset_cfg.name]
+        self._geom_ids = asset.indexing.geom_ids[asset_cfg.geom_ids]
+        # geom_pos is shared by all worlds unless expanded (this also re-captures the CUDA graphs).
+        if "geom_pos" not in env.sim.expanded_fields:
+            env.sim.expand_model_fields(("geom_pos",))
+        self._default = env.sim.get_default_field("geom_pos")[self._geom_ids].clone()  # [G, 3]
+        self._u = torch.empty(env.num_envs, len(self._geom_ids), 3, device=env.device).uniform_(-1.0, 1.0)
+
+    def __call__(
+        self,
+        env: ManagerBasedRlEnv,
+        env_ids: torch.Tensor | slice,
+        asset_cfg: SceneEntityCfg,
+        max_offset: float,
+        start_frac: float,
+        hold_steps: int,
+        full_steps: int,
+    ) -> dict[str, float]:
+        del env_ids, asset_cfg
+        alpha = _dr_ramp(env.common_step_counter, hold_steps, full_steps)
+        offset = max_offset * (start_frac + alpha * (1.0 - start_frac))
+        env.sim.model.geom_pos[:, self._geom_ids] = self._default + offset * self._u
+        return {"progress": alpha, "max_offset_mm": offset * 1e3}
 
 
 def bam_torque_utilisation(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG) -> torch.Tensor:
@@ -494,29 +738,43 @@ class motion_contact_schedule:
 
     def __init__(self, cfg, env: ManagerBasedRlEnv):
         command = cast(MotionCommand, env.command_manager.get_term(cfg.params["command_name"]))
+        ball_ref = self._ball_reference(cfg, env, command)
+        holds = torch.tensor(cfg.params["hold_positions"], dtype=torch.float32, device=env.device)  # [H, 3], env frame
+        self.contact, self.next_frame, self.next_pos = self._schedule(ball_ref, holds, cfg.params.get("threshold", 0.003))
+        self.future = torch.tensor(cfg.params["offsets"], device=env.device)  # [K]
+        self.step_dt = env.step_dt
+
+    @staticmethod
+    def _ball_reference(cfg, env: ManagerBasedRlEnv, command: MotionCommand) -> torch.Tensor:
+        """[T, N, 3] reference ball positions of every motion frame, env frame."""
         motion = command.motion
         idx, offs = _ball_site_offsets(env, command, tuple(cfg.params["site_names"]), cfg.params.get("asset_name", "robot"))
         body_pos, body_quat = motion.body_pos_w[:, idx], motion.body_quat_w[:, idx]  # [T, N, ...], env frame
-        ball_ref = body_pos + quat_apply(body_quat, offs.expand_as(body_pos))
-        holds = torch.tensor(cfg.params["hold_positions"], dtype=torch.float32, device=env.device)  # [H, 3], env frame
+        return body_pos + quat_apply(body_quat, offs.expand_as(body_pos))
+
+    @staticmethod
+    def _schedule(
+        ball_ref: torch.Tensor, holds: torch.Tensor, threshold: float
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """For reference balls [T, N, 3] and hold sockets [H, 3]: expected contacts [T, N], next expected contact
+        frame [T, N] (in 0..T-1) and its hold position [T, N, 3]."""
         dist, hold_id = torch.cdist(ball_ref, holds[None].expand(ball_ref.shape[0], -1, -1)).min(dim=-1)  # [T, N]
-        self.contact = dist < cfg.params.get("threshold", 0.003)  # [T, N]
+        contact = dist < threshold  # [T, N]
 
         # Next expected contact frame from each frame on (backward scan); after the last one, the last one.
-        contact = self.contact.cpu().numpy()
-        T, N = contact.shape
+        contact_np = contact.cpu().numpy()
+        T, N = contact_np.shape
         nxt = np.empty((T, N), dtype=np.int64)
         last = np.full(N, -1)
         for t in range(T - 1, -1, -1):
-            last = np.where(contact[t], t, last)
+            last = np.where(contact_np[t], t, last)
             nxt[t] = last
         for n in range(N):  # no contact left: the last contact of the motion (or the last frame)
-            c = np.nonzero(contact[:, n])[0]
+            c = np.nonzero(contact_np[:, n])[0]
             nxt[nxt[:, n] < 0, n] = c[-1] if len(c) else T - 1
-        self.next_frame = torch.tensor(nxt, device=env.device)  # [T, N]
-        self.next_pos = holds[hold_id.gather(0, self.next_frame)]  # [T, N, 3], env frame
-        self.future = torch.tensor(cfg.params["offsets"], device=env.device)  # [K]
-        self.step_dt = env.step_dt
+        next_frame = torch.tensor(nxt, device=ball_ref.device)  # [T, N]
+        next_pos = holds[hold_id.gather(0, next_frame)]  # [T, N, 3], env frame
+        return contact, next_frame, next_pos
 
     def __call__(
         self,
@@ -532,13 +790,17 @@ class motion_contact_schedule:
         command = cast(MotionCommand, env.command_manager.get_term(command_name))
         t = command.time_steps
         B = t.shape[0]
-        idx = torch.clamp(t[:, None] + self.future, max=self.contact.shape[0] - 1)  # [B, K]
+        idx = torch.clamp(motion_frames_ahead(command, self.future), max=self.contact.shape[0] - 1)  # [B, K]
         now = self.contact[t].float()  # [B, N]
         future = self.contact[idx].float().reshape(B, -1)  # [B, K * N]
         next_pos_w = self.next_pos[t] + env.scene.env_origins[:, None]  # [B, N, 3]
         q_inv = quat_inv(command.robot_anchor_quat_w)[:, None].expand(-1, next_pos_w.shape[1], -1)
         next_pos_b = quat_apply(q_inv, next_pos_w - command.robot_anchor_pos_w[:, None]).reshape(B, -1)
-        time_to = torch.clamp((self.next_frame[t] - t[:, None]).clamp(min=0) * self.step_dt, max=max_time)
+        frames_to = (self.next_frame[t] - t[:, None]).clamp(min=0).float()
+        speed = getattr(command, "speed", None)
+        if speed is not None:  # motion_speed_curriculum: speed motion frames per env step
+            frames_to = frames_to / speed[:, None]
+        time_to = torch.clamp(frames_to * self.step_dt, max=max_time)
         return torch.cat([now, future, next_pos_b, time_to], dim=-1)
 
 
@@ -596,7 +858,7 @@ def motion_future_joint_pos(
     asset: Entity = env.scene[asset_cfg.name]
     motion = command.motion
     future = torch.arange(1, num_steps + 1, device=env.device) * stride  # [K]
-    idx = torch.clamp(command.time_steps[:, None] + future, max=motion.time_step_total - 1)  # [B, K]
+    idx = motion_frames_ahead(command, future)  # [B, K]
     joint_pos = motion.joint_pos[idx] - asset.data.default_joint_pos[:, None]  # [B, K, J]
     return joint_pos.reshape(joint_pos.shape[0], -1)
 
@@ -635,6 +897,7 @@ class ResidualJointPositionAction(JointPositionAction):
         super().__init__(cfg=cfg, env=env)
         self._env = env
         self._command: MotionCommand | None = None  # the command manager is built after the actions
+        self._one = torch.ones(1, dtype=torch.long, device=env.device)
         if cfg.stiffness_scale is not None:
             self._stiffness_per_kp, self._effort_limit = bam_stiffness_and_effort_limit(_bam_actuators(self._entity)[0])
 
@@ -648,7 +911,7 @@ class ResidualJointPositionAction(JointPositionAction):
         if self._command is None:
             self._command = cast(MotionCommand, self._env.command_manager.get_term(self.cfg.command_name))
         motion = self._command.motion
-        next_step = torch.clamp(self._command.time_steps + 1, max=motion.time_step_total - 1)
+        next_step = motion_frames_ahead(self._command, self._one)[:, 0]
         ref_joint_pos = motion.joint_pos[next_step][:, self._target_ids]
         encoder_bias = self._entity.data.encoder_bias[:, self._target_ids]
         target = ref_joint_pos + self._processed_actions - encoder_bias
@@ -753,7 +1016,23 @@ def base_yaw_rel_board_cos_sin(
     Exact and drift-free (no episode offset): the trunk orientation is expressed in the board frame and its yaw
     taken there, so it is 0 when the trunk faces the board as in the start pose.
     """
+    return _cos_sin(_base_yaw_rel_board(env, board_name, asset_cfg))
+
+
+def _base_yaw_rel_board(env: ManagerBasedRlEnv, board_name: str, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """The trunk's rotation (rad, in (-pi, pi]) about the board's z axis, relative to the board."""
     asset: Entity = env.scene[asset_cfg.name]
     board: Entity = env.scene[board_name]
     q_rel = quat_mul(quat_inv(board.data.root_link_quat_w), asset.data.root_link_quat_w)
-    return _cos_sin(_yaw_from_quat(q_rel))
+    return _yaw_from_quat(q_rel)
+
+
+def base_yaw_rel_board_exceeded(
+    env: ManagerBasedRlEnv,
+    max_yaw: float,
+    board_name: str = "wall",
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Termination: the trunk is rotated about the board's z axis by more than max_yaw (rad) relative to the
+    board (0 = facing the board as in the start pose)."""
+    return _base_yaw_rel_board(env, board_name, asset_cfg).abs() > max_yaw

@@ -267,31 +267,37 @@ def _one_box_conaffinity(box_name: str) -> int:
     return COLLISION_WORLD
 
 
-def get_spec(spec: WallSpec, used: frozenset[int] | None = None) -> mujoco.MjSpec:
-    """The board and the holds of climbing_sim.scene.build_spec, in the env frame, all in one body "wall"
-    (the ball contact sensor matches its geoms).
-
-    The holds keep climbing_sim's visual mesh, but collide as boxes (hold_boxes.py): the holds in ``used``
-    (those the motion puts a ball on, see ``used_holds``) as the 5-box cup, the others as the 1-box block.
-    used=None: every hold is a 5-box cup. Collision groups: see COLLISION_WORLD."""
+def _new_wall_spec() -> tuple[mujoco.MjSpec, mujoco.MjsBody, mujoco.MjsBody]:
+    """An empty wall spec: its materials and hold mesh, the body "wall" and its child ONE_BOX_BODY."""
     wall_mod, _ = _climbing_sim()
-    wall = sim_wall(spec)
     assets = Path(wall_mod.__file__).parent / "assets" / "hold"
-    friction = [HOLD_FRICTION, 0.005, 0.0001]
-
     mj = mujoco.MjSpec()
     mj.add_material(name="wall_wood", rgba=[0.86, 0.75, 0.56, 1.0])
     mj.add_material(name="wall_hold", rgba=[0.85, 0.35, 0.15, 1.0])
     mj.add_mesh(name="hold_visual", file=str(assets / "hold_visual.stl"))
-
     body = mj.worldbody.add_body(name="wall")
+    # The 1-box blocks are on a child body of the wall (fixed to it, no joint), so that a contact sensor can single
+    # them out (ONE_BOX_BODY: the climbing env penalises the balls touching them).
+    blocks_body = body.add_body(name=ONE_BOX_BODY)
+    return mj, body, blocks_body
+
+
+def _add_board(body, blocks_body, spec: WallSpec, used: frozenset[int] | None, offset=(0.0, 0.0, 0.0),
+               prefix: str = "") -> None:
+    """The board and the holds of ``spec`` (see get_spec), translated by ``offset`` (env frame), their geom / site
+    names prefixed by ``prefix``."""
+    wall_mod, _ = _climbing_sim()
+    wall = sim_wall(spec)
+    offset = np.asarray(offset, float)
+    friction = [HOLD_FRICTION, 0.005, 0.0001]
+
     # Board: climbing_sim's box (0 <= x <= W, 0 <= y <= thickness, 0 <= z <= H in the simulator frame).
     w, t, h = wall_mod.WALL_WIDTH, wall_mod.WALL_THICKNESS, wall_mod.WALL_HEIGHT
     body.add_geom(
-        name="board",
+        name=f"{prefix}board",
         type=mujoco.mjtGeom.mjGEOM_BOX,
         size=[t / 2, w / 2, h / 2],  # rotated: env x = sim y, env y = -sim x
-        pos=sim_to_env([w / 2, t / 2, h / 2]).tolist(),
+        pos=(sim_to_env([w / 2, t / 2, h / 2]) + offset).tolist(),
         material="wall_wood",
         condim=3,
         friction=friction,
@@ -300,13 +306,11 @@ def get_spec(spec: WallSpec, used: frozenset[int] | None = None) -> mujoco.MjSpe
     )
 
     quat = SIM_TO_ENV_QUAT.tolist()
-    # The 1-box blocks are on a child body of the wall (fixed to it, no joint), so that a contact sensor can single
-    # them out (ONE_BOX_BODY: the climbing env penalises the balls touching them).
-    blocks_body = body.add_body(name=ONE_BOX_BODY)
     for k, hold in enumerate(wall.holds):
-        socket = sim_to_env(hold.socket)
-        name = f"hold{k}_c{hold.col}_r{hold.row}"
-        body.add_site(name=f"hold{k}_socket", pos=socket.tolist(), size=[0.002, 0, 0], rgba=[0.1, 0.9, 0.2, 1], group=4)
+        socket = sim_to_env(hold.socket) + offset
+        name = f"{prefix}hold{k}_c{hold.col}_r{hold.row}"
+        body.add_site(name=f"{prefix}hold{k}_socket", pos=socket.tolist(), size=[0.002, 0, 0], rgba=[0.1, 0.9, 0.2, 1],
+                      group=4)
         body.add_geom(
             name=f"{name}_visual",
             type=mujoco.mjtGeom.mjGEOM_MESH,
@@ -324,6 +328,26 @@ def get_spec(spec: WallSpec, used: frozenset[int] | None = None) -> mujoco.MjSpe
         else:
             _add_hold_boxes(blocks_body, name, socket, hold_boxes.ONE_BOX, friction, rgba=[0.7, 0.3, 0.85, 1],
                             conaffinity=_one_box_conaffinity)
+
+
+def get_spec(spec: WallSpec, used: frozenset[int] | None = None) -> mujoco.MjSpec:
+    """The board and the holds of climbing_sim.scene.build_spec, in the env frame, all in one body "wall"
+    (the ball contact sensor matches its geoms).
+
+    The holds keep climbing_sim's visual mesh, but collide as boxes (hold_boxes.py): the holds in ``used``
+    (those the motion puts a ball on, see ``used_holds``) as the 5-box cup, the others as the 1-box block.
+    used=None: every hold is a 5-box cup. Collision groups: see COLLISION_WORLD."""
+    mj, body, blocks_body = _new_wall_spec()
+    _add_board(body, blocks_body, spec, used)
+    return mj
+
+
+def get_multi_board_spec(boards, offsets) -> mujoco.MjSpec:
+    """Several walls side by side in one body "wall" (one ONE_BOX_BODY for all their 1-box blocks): board i is
+    ``boards[i] = (WallSpec, used holds)``, translated by ``offsets[i]`` (env frame), its names prefixed "b<i>_"."""
+    mj, body, blocks_body = _new_wall_spec()
+    for i, ((spec, used), offset) in enumerate(zip(boards, offsets, strict=True)):
+        _add_board(body, blocks_body, spec, used, offset, prefix=f"b{i}_")
     return mj
 
 

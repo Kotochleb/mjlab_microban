@@ -32,8 +32,14 @@ GUI:
   on itself) is flagged. "Scan reference" checks every frame of the motion, "Next issue" jumps to the next
   flagged frame.
 
+Multi-board (--multi-board, or --boards-file F): the scene of the multi-board env (tasks/climbing/multi_board.py),
+every board of the board file side by side, and a "Board" dropdown to pick the one played: its planned climb (the
+planner output next to the board's motion, <motion>_q.npz, as scripts/make_multi_board_motions.py leaves it) is
+played on it, and the camera moves to it. --board picks the first one shown.
+
 Usage:
     uv run python src/mjlab_microban/scripts/play_open_loop.py --motion-file src/mjlab_microban/motion/l1s0_q.npz
+    uv run python src/mjlab_microban/scripts/play_open_loop.py --multi-board --board 3
 """
 
 import argparse
@@ -55,7 +61,18 @@ from mjlab.viewer.viser.scene import MjlabViserScene
 from mjlab_microban.tasks.climbing.mdp import set_bam_kp
 from mjlab_microban.robot.microban_climb_constants import BALL_GEOM_NAMES, BALL_SITE_NAMES
 from mjlab_microban.tasks.climbing.microban_climbing_env_cfg import KP, make_microban_climbing_env_cfg
-from mjlab_microban.tasks.climbing.wall import SIM_TO_ENV_QUAT, hold_positions, resolve_wall, sim_to_env, start_positions
+from mjlab_microban.tasks.climbing.microban_climbing_multi_board_env_cfg import (
+    make_microban_climbing_multi_board_env_cfg,
+)
+from mjlab_microban.tasks.climbing.multi_board import Board, load_board_set
+from mjlab_microban.tasks.climbing.wall import (
+    SIM_TO_ENV_QUAT,
+    hold_positions,
+    motion_wall,
+    resolve_wall,
+    sim_to_env,
+    start_positions,
+)
 
 DEFAULT_MOTION = Path(__file__).parents[1] / "motion" / "l1s0_q.npz"
 
@@ -75,7 +92,14 @@ GHOST_RGBA = (0.3, 0.7, 1.0, 0.4)
 
 COLLISION_GEOM_GROUP = 3  # climbing_sim's hold collision geoms (wall.py), and the robot's
 MAX_LISTED_CONTACTS = 20
-HOLD_GEOM_RE = re.compile(r"hold(\d+)_c(\d+)_r(\d+)")
+HOLD_GEOM_RE = re.compile(r"(?:b(\d+)_)?hold(\d+)_c(\d+)_r(\d+)")  # b<i>_: board i of a multi-board wall
+HOLD_LABEL_RE = re.compile(r"(?:board\d+ )?hold")  # _geom_label of a hold geom
+BOARD_LABEL_RE = re.compile(r"(?:b\d+_)?board")  # the board geom (b<i>_board on a multi-board wall)
+
+# Multi-board camera: on the robot's side of the board, looking at its middle, CAMERA_DISTANCE away, CAMERA_ELEVATION up.
+CAMERA_TARGET = (0.0, 0.0, 0.6)
+CAMERA_DISTANCE = 1.8
+CAMERA_ELEVATION_DEG = 15.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -91,6 +115,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--kp", type=float, default=KP, help="BAM firmware P gain (default: %(default)s)")
     p.add_argument("--device", type=str, default="cuda:0")
     p.add_argument("--port", type=int, default=8080, help="Viser server port (default: 8080)")
+    p.add_argument("--multi-board", action="store_true",
+                   help="all the boards of the board file, with a dropdown to pick the one played (--motion-file and "
+                        "--level/--seed/--wall/--offset are then not used)")
+    p.add_argument("--boards-file", type=Path, default=None,
+                   help="board file of --multi-board (implies it; default: $MICROBAN_BOARDS_FILE or "
+                        "tasks/climbing/boards/multi_board.json)")
+    p.add_argument("--board", type=int, default=0, help="--multi-board: index of the board shown first (default: 0)")
     return p.parse_args()  # fmt: skip
 
 
@@ -134,10 +165,23 @@ class OpenLoopPlayer:
             device = "cpu"
         self.device = device
 
-        self.wall = resolve_wall(args.motion_file, args.level, args.seed, args.wall)
-        print(f"[INFO] wall {self.wall}: {len(hold_positions(self.wall))} holds")
-        # The holds of the motion's used_holds collide as 5-box cups, the others as 1-box blocks.
-        cfg = make_microban_climbing_env_cfg(play=True, wall=self.wall, motion_file=str(args.motion_file))
+        self.fps = args.fps
+        self.offset = np.array(args.offset)
+        self.board_set = None
+        self.board = 0
+        if args.multi_board or args.boards_file is not None:
+            # Every board of the board file, each with its used holds as 5-box cups (multi_board.py).
+            self.board_set = load_board_set(args.boards_file)
+            if not 0 <= args.board < len(self.board_set.boards):
+                raise SystemExit(f"--board {args.board}: the board file has {len(self.board_set.boards)} boards")
+            self.plan_files = [self._plan_file(b) for b in self.board_set.boards]
+            self.offset = np.zeros(3)
+            cfg = make_microban_climbing_multi_board_env_cfg(play=True, boards_file=args.boards_file)
+        else:
+            self.wall = resolve_wall(args.motion_file, args.level, args.seed, args.wall)
+            print(f"[INFO] wall {self.wall}: {len(hold_positions(self.wall))} holds")
+            # The holds of the motion's used_holds collide as 5-box cups, the others as 1-box blocks.
+            cfg = make_microban_climbing_env_cfg(play=True, wall=self.wall, motion_file=str(args.motion_file))
         cfg.scene.num_envs = 1
         self.decimation = cfg.decimation
         self.physics_dt = cfg.sim.mujoco.timestep
@@ -149,9 +193,11 @@ class OpenLoopPlayer:
 
         self.robot: Entity = self.scene["robot"]
         set_bam_kp(self.robot, args.kp)
-        self.motion = Motion(args.motion_file, list(self.robot.joint_names), np.array(args.offset), args.fps)
-        print(f"[INFO] {self.motion.num_frames} frames ({self.motion.num_frames * self.motion.dt:.1f} s) "
-              f"from {args.motion_file}, joints: {list(self.robot.joint_names)}")  # fmt: skip
+        print(f"[INFO] joints: {list(self.robot.joint_names)}")
+        if self.board_set is None:
+            self._load_motion(args.motion_file)
+        else:
+            self._select_board(args.board)
 
         idx = self.robot.indexing
         self._free_q_adr = idx.free_joint_q_adr.cpu().numpy()
@@ -165,6 +211,52 @@ class OpenLoopPlayer:
         self._setup_viser(args.port)
         self.reset_to_frame(0)
         self._check_start()
+
+    # --------------------------------------------------------------- boards
+
+    @staticmethod
+    def _plan_file(board: Board) -> Path:
+        """The planner output (q) of a board: next to its motion, <motion>_q.npz, on the board's wall."""
+        motion = Path(board.motion_file)
+        plan = motion.with_name(motion.stem + "_q.npz")
+        if not plan.exists():
+            raise SystemExit(
+                f"[ERROR] {plan}: no planned climb for the board {board.wall}; make it with "
+                "src/mjlab_microban/scripts/make_multi_board_motions.py"
+            )
+        if motion_wall(plan) != board.wall:
+            raise SystemExit(f"[ERROR] {plan} was planned on wall {motion_wall(plan)}, the board is {board.wall}")
+        return plan
+
+    def _board_label(self, i: int) -> str:
+        b = self.board_set.boards[i]
+        return f"{i}: level {b.wall.level}, seed {b.wall.seed}"
+
+    def _load_motion(self, path: Path) -> None:
+        self.motion = Motion(path, list(self.robot.joint_names), self.offset, self.fps)
+        print(f"[INFO] {self.motion.num_frames} frames ({self.motion.num_frames * self.motion.dt:.1f} s) from {path}")
+
+    def _select_board(self, i: int) -> None:
+        """Play board i of the board file: its wall, its planned climb, the env origin on it."""
+        board = self.board_set.boards[i]
+        self.board = i
+        self.wall = board.wall
+        self.scene.env_origins[0] = torch.tensor(self.board_set.offsets[i], device=self.device)
+        print(f"[INFO] board {self._board_label(i)}: {len(hold_positions(self.wall))} holds")
+        self._load_motion(self.plan_files[i])
+        self._issue_frames = np.zeros(0, dtype=int)
+
+    def _board_camera(self) -> tuple[np.ndarray, np.ndarray]:
+        """(position, look_at) of the multi-board camera on the current board."""
+        target = np.array(CAMERA_TARGET) + np.array(self.board_set.offsets[self.board])
+        el = np.deg2rad(CAMERA_ELEVATION_DEG)
+        return target + CAMERA_DISTANCE * np.array([-np.cos(el), 0.0, np.sin(el)]), target
+
+    def _aim_cameras(self, clients=None) -> None:
+        position, look_at = self._board_camera()
+        for client in clients if clients is not None else self.server.get_clients().values():
+            client.camera.position = position
+            client.camera.look_at = look_at
 
     def _check_start(self) -> None:
         """Print how far the first frame's balls are from their start sockets (is it the motion's wall?)."""
@@ -245,7 +337,8 @@ class OpenLoopPlayer:
         hold = HOLD_GEOM_RE.search(name)
         if hold:
             part = name[hold.end() :].lstrip("_") or "?"
-            return f"hold{hold[1]} (c{hold[2]} r{hold[3]}) {part}"
+            board = f"board{hold[1]} " if hold[1] is not None else ""
+            return f"{board}hold{hold[2]} (c{hold[3]} r{hold[4]}) {part}"
         return name
 
     def _contacts(self, which: str, with_forces: bool, frame: int | None = None) -> list[dict]:
@@ -276,7 +369,7 @@ class OpenLoopPlayer:
             if k2 in ("ball", "robot") and k1 not in ("ball", "robot"):
                 g1, g2, k1, k2 = g2, g1, k2, k1  # the robot's geom first
             other = self._geom_label(g2)
-            expected = k1 == "ball" and k2 == "wall" and other.startswith("hold")
+            expected = k1 == "ball" and k2 == "wall" and HOLD_LABEL_RE.match(other) is not None
             if k1 in ("ball", "robot") and k2 in ("ball", "robot"):
                 kind = "self collision"
             elif k2 == "floor":
@@ -284,7 +377,7 @@ class OpenLoopPlayer:
             elif expected:
                 kind = "ball in hold"
             elif k1 == "ball":
-                kind = "ball on " + ("the board" if other == "board" else "a hold's outside")
+                kind = "ball on " + ("the board" if BOARD_LABEL_RE.fullmatch(other) else "a hold's outside")
             else:
                 kind = "body on the wall"
             f = None
@@ -369,6 +462,26 @@ class OpenLoopPlayer:
         self.vscene.camera_tracking_enabled = False  # keep the wall still
 
         gui = self.server.gui
+        if self.board_set is not None:
+            with gui.add_folder("Board"):
+                labels = tuple(self._board_label(i) for i in range(len(self.board_set.boards)))
+                self.board_dropdown = gui.add_dropdown("Board", labels, initial_value=labels[self.board])
+
+            @self.board_dropdown.on_update
+            def _(_) -> None:
+                i = labels.index(self.board_dropdown.value)
+                with self.lock:
+                    self.playing = False
+                    self._select_board(i)
+                    self.frame_slider.max = self.motion.num_frames - 1
+                    self.frame_slider.value = 0
+                    self.scan_md.content = ""
+                    self.reset_to_frame(0)
+                    self._check_start()
+                self._refresh_play_button()
+                self._aim_cameras()
+                self.render()
+
         with gui.add_folder("Motion"):
             self.play_button = gui.add_button("Play", icon=viser.Icon.PLAYER_PLAY)
             self.frame_slider = gui.add_slider(
@@ -389,6 +502,11 @@ class OpenLoopPlayer:
             next_issue_button = gui.add_button("Next issue", icon=viser.Icon.ARROW_RIGHT)
             self.scan_md = gui.add_markdown("")
         self.vscene.create_visualization_gui(camera_distance=1.8, camera_azimuth=180.0, camera_elevation=15.0)
+        if self.board_set is not None:
+            # The default camera aims at the middle of all the boards: aim it at the board played instead.
+            @self.server.on_client_connect
+            def _(client: viser.ClientHandle) -> None:
+                self._aim_cameras([client])
 
         @self.play_button.on_click
         def _(_) -> None:

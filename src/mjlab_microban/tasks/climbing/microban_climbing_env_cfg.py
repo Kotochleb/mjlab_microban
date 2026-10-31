@@ -47,6 +47,7 @@ from mjlab_microban.robot.microban_climb_constants import (
     BALL_GEOM_NAMES,
     BALL_SITE_NAMES,
     FEET_BODY_NAMES,
+    GRIP_GEOM_NAMES,
     HANDLE_GEOM_NAMES,
     HANDS_BODY_NAMES,
     MICROBAN_CLIMB_ROBOT_CFG,
@@ -389,8 +390,11 @@ def make_microban_climbing_env_cfg(
         params={"pose_range": {}, "asset_cfg": SceneEntityCfg("wall")},
     )
 
-    # The balls are what touches the holds: randomise their friction (the feet's in the tracking task).
-    cfg.events["foot_friction"].params["asset_cfg"].geom_names = (r"^.*_ball_coll$",)
+    # The balls and capsules are what touches the holds: randomise their friction (the feet's in the tracking
+    # task), sliding coefficient U(0.1, 0.5), shared by all of them in an env. They have priority 1, so this is
+    # the friction of their contacts with the holds (and with the board / floor), not the holds' HOLD_FRICTION.
+    cfg.events["foot_friction"].params["asset_cfg"].geom_names = GRIP_GEOM_NAMES
+    cfg.events["foot_friction"].params["ranges"] = (0.1, 0.5)
 
     cfg.events["base_com"].params["asset_cfg"].body_names = ("trunk",)
     cfg.events["base_com"].params["ranges"] = {
@@ -408,20 +412,50 @@ def make_microban_climbing_env_cfg(
             "ranges": (0.9, 1.1),
         },
     )
-    cfg.events["dof_friction_randomization"] = EventTermCfg(
-        mode="startup",
-        func=dr.joint_friction,
-        params={
-            "asset_cfg": SceneEntityCfg("robot", joint_names=(r".*",)),
-            "operation": "scale",
-            "ranges": (0.9, 1.1),
-        },
-    )
+    # No dof_friction_randomization event: BAM zeroes MuJoCo's frictionloss and models the joint friction
+    # itself, so the friction is randomised by the actuator_dr curriculum below instead.
 
     #---------------------------- Curriculum ------------------------
     # Boosted motors (15 V, 3 A) at the start, linearly down to the realistic ones (the BAM actuator config's
     # vin_range / max_current) over 500 training iterations of 24 env steps each.
     if not play:
+        # Actuator DR: joint friction +-10 % and battery voltage 7-9 V (8 V +-12.5 %), per env. Both ranges
+        # start at +-1 %, held until iteration 500, then widen linearly to the full ones at iteration 1000.
+        # Listed before bam_power, which interpolates its boosted voltage to these.
+        cfg.curriculum["actuator_dr"] = CurriculumTermCfg(
+            func=mdp.actuator_dr_curriculum,
+            params={
+                "vin_nominal": 8.0,
+                "vin_rel_range": 0.125,
+                "friction_rel_range": 0.10,
+                "rel_start": 0.01,
+                "hold_steps": 500 * 24,
+                "full_steps": 1000 * 24,
+            },
+        )
+        # Ball sphere (collision geom) positions: +-1 mm in x, y and z, per env and ball, same schedule.
+        cfg.curriculum["ball_pos_dr"] = CurriculumTermCfg(
+            func=mdp.geom_pos_dr_curriculum,
+            params={
+                "asset_cfg": SceneEntityCfg("robot", geom_names=BALL_GEOM_NAMES),
+                "max_offset": 0.001,
+                "start_frac": 0.01,
+                "hold_steps": 500 * 24,
+                "full_steps": 1000 * 24,
+            },
+        )
+        # Reference motion speed, per env and episode: U(0.95, 1.05) up to iteration 500, then the bounds widen
+        # linearly to U(0.9, 1.5) at iteration 1500.
+        cfg.curriculum["motion_speed"] = CurriculumTermCfg(
+            func=mdp.motion_speed_curriculum,
+            params={
+                "command_name": "motion",
+                "start_range": (0.95, 1.05),
+                "full_range": (0.9, 1.5),
+                "hold_steps": 500 * 24,
+                "full_steps": 1500 * 24,
+            },
+        )
         cfg.curriculum["bam_power"] = CurriculumTermCfg(
             func=mdp.bam_power_curriculum,
             params={"vin_start": 15.0, "max_current_start": 3.0, "num_steps": 500 * 24},
@@ -434,6 +468,11 @@ def make_microban_climbing_env_cfg(
     # Stopgap: rare physics blow-ups (NaN state) under violent early-training actions; reset those envs
     # before their observations are computed (their reward is already zeroed by the reward manager).
     cfg.terminations["nan_detection"] = TerminationTermCfg(func=envs_mdp.nan_detection)
+    # The trunk turned away from the board: more than 60 deg about the board's z axis.
+    cfg.terminations["base_yaw_rel_board"] = TerminationTermCfg(
+        func=mdp.base_yaw_rel_board_exceeded,
+        params={"max_yaw": math.radians(60.0), "board_name": "wall"},
+    )
 
     #---------------------------- Viewer ----------------------------
     # Camera on the robot's side of the wall, looking straight at the holds (+x), ~1.5 m from the wall.

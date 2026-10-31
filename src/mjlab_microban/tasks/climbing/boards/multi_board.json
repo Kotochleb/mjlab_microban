@@ -1,0 +1,16 @@
+{
+  "description": "Boards of the multi-board climbing env (tasks/climbing/multi_board.py): one level 1 board (curriculum level 0, the easiest) and nine level 2 boards. Level 2 seeds: the longest (partial) climbs rock-climbing-workshop's planner finds and its trajectory optimiser solves. Motions: src/mjlab_microban/motion/<motion>, made by scripts/make_multi_board_motions.py.",
+  "spacing": 1.2,
+  "boards": [
+    {"level": 1, "seed": 0, "motion": "l1s0.npz"},
+    {"level": 2, "seed": 0},
+    {"level": 2, "seed": 43},
+    {"level": 2, "seed": 45},
+    {"level": 2, "seed": 85},
+    {"level": 2, "seed": 19},
+    {"level": 2, "seed": 48},
+    {"level": 2, "seed": 53},
+    {"level": 2, "seed": 71},
+    {"level": 2, "seed": 74}
+  ]
+}
