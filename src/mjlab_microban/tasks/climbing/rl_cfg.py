@@ -54,8 +54,8 @@ MicrobanClimbingRlCfg = RslRlOnPolicyRunnerCfg(
     max_iterations=30_000,
 )
 
-# Residual variant: with the 0.25 action scale, an initial std of 0.5 gives ~0.125 rad of exploration
-# noise around the reference instead of swamping it.
+# Residual variant: the action scale is 0.25 * effort_limit / stiffness (~0.47 rad at the final gain); an
+# initial std of 0.5 gives ~0.25 rad of exploration noise around the reference instead of swamping it.
 MicrobanClimbingResidualRlCfg = deepcopy(MicrobanClimbingRlCfg)
 MicrobanClimbingResidualRlCfg.actor.distribution_cfg["init_std"] = 0.5
 MicrobanClimbingResidualRlCfg.experiment_name = "mjlab_microban_climbing_residual"

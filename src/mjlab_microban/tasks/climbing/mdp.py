@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, cast
 import numpy as np
 import torch
 
+from bam.mjlab import BamActuator
 from mjlab.entity import Entity
 from mjlab.envs.mdp.actions import JointPositionAction, JointPositionActionCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
@@ -248,6 +249,67 @@ class motion_future_window:
         )
 
 
+# ---------------------------------------------------------------------------------------------------------
+# PD gain curriculum and stiffness-dependent action scale (BAM actuators)
+# ---------------------------------------------------------------------------------------------------------
+
+
+def _bam_actuators(asset: Entity) -> list[BamActuator]:
+    acts = [act for act in asset.actuators if isinstance(act, BamActuator)]
+    assert acts, "the PD gain curriculum needs BAM actuators"
+    return acts
+
+
+def bam_kp(asset: Entity) -> torch.Tensor:
+    """Current firmware P gain (kp_fw units) of each env, shape [B]."""
+    act = _bam_actuators(asset)[0]
+    return act.kp_scale[:, 0] * float(act._bam_model.actuator.kp)
+
+
+def set_bam_kp(asset: Entity, kp: float | torch.Tensor) -> None:
+    """Set the firmware P gain (kp_fw units) of all BAM actuators, for all envs."""
+    for act in _bam_actuators(asset):
+        act.kp_scale[:] = kp / float(act._bam_model.actuator.kp)
+
+
+def bam_stiffness_and_effort_limit(act: BamActuator) -> tuple[float, float]:
+    """(stiffness per unit kp_fw [Nm/rad], effort limit [Nm]) of a BAM actuator, at its nominal voltage.
+
+    BAM firmware law: torque = kt/R * vin * clip(kp_fw * error_gain * err, +-max_pwm) (- back-EMF), clipped
+    to +-max_current * kt. So the stiffness is K = kt/R * vin * error_gain * kp_fw. vin is the middle of
+    the randomised range.
+    """
+    bam, cfg = act._bam_model, act.cfg
+    kt, R = bam.kt.value, bam.R.value
+    vin = sum(cfg.vin_range) / 2 if cfg.vin_range is not None else bam.actuator.vin
+    effort_limit = kt / R * vin * bam.actuator.max_pwm
+    if cfg.max_current is not None:
+        effort_limit = min(effort_limit, cfg.max_current * kt)
+    return kt / R * vin * bam.actuator.error_gain, effort_limit
+
+
+def pd_gain_curriculum(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor | slice,
+    kp_start: float,
+    kp_end: float,
+    num_iterations: int,
+    steps_per_iteration: int,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Linear decay of the firmware P gain from kp_start to kp_end over num_iterations training iterations.
+
+    A training iteration is ``steps_per_iteration`` policy steps (the runner's num_steps_per_env);
+    ``env.common_step_counter`` is restored on resume, so is the curriculum. The gain is set for all envs
+    (the curriculum manager runs on every reset). It is not observed by the policy.
+    """
+    iteration = env.common_step_counter / steps_per_iteration
+    frac = min(iteration / num_iterations, 1.0) if num_iterations > 0 else 1.0
+    kp = kp_start + (kp_end - kp_start) * frac
+    set_bam_kp(env.scene[asset_cfg.name], kp)
+    return torch.tensor(kp)
+
+
 @dataclass(kw_only=True)
 class ResidualJointPositionActionCfg(JointPositionActionCfg):
     """Joint position targets as residuals on the reference motion: target = ref_joint_pos + scale * a.
@@ -256,10 +318,15 @@ class ResidualJointPositionActionCfg(JointPositionActionCfg):
     applied during the physics substeps of the step, after which the motion command advances to t + 1
     and the rewards compare the robot to that frame. Using frame t would make the feedforward lag by one
     policy step.
+
+    With ``stiffness_scale`` set, ``scale`` is ignored and the action scale is BeyondMimic's
+    ``stiffness_scale * effort_limit / stiffness``, recomputed every step from each env's current BAM P gain
+    (so it follows the PD gain curriculum).
     """
 
     command_name: str = "motion"
     use_default_offset: bool = False
+    stiffness_scale: float | None = None
 
     def __post_init__(self):
         super().__post_init__()
@@ -277,6 +344,14 @@ class ResidualJointPositionAction(JointPositionAction):
         super().__init__(cfg=cfg, env=env)
         self._env = env
         self._command: MotionCommand | None = None  # the command manager is built after the actions
+        if cfg.stiffness_scale is not None:
+            self._stiffness_per_kp, self._effort_limit = bam_stiffness_and_effort_limit(_bam_actuators(self._entity)[0])
+
+    def process_actions(self, actions: torch.Tensor) -> None:
+        if self.cfg.stiffness_scale is not None:
+            stiffness = self._stiffness_per_kp * bam_kp(self._entity)  # [B] Nm/rad
+            self._scale = (self.cfg.stiffness_scale * self._effort_limit / stiffness).unsqueeze(-1)
+        super().process_actions(actions)
 
     def apply_actions(self) -> None:
         if self._command is None:

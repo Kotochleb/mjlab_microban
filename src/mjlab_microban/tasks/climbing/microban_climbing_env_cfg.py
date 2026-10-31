@@ -17,12 +17,14 @@ only slightly; joint torques and action rate are penalised. The RL config is a c
 tasks/tracking/rl_cfg.py.
 """
 
+import math
 from copy import deepcopy
 
 from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs import mdp as envs_mdp
 from mjlab.envs.mdp import dr
 from mjlab.envs.mdp.actions import JointPositionActionCfg
+from mjlab.managers.curriculum_manager import CurriculumTermCfg
 from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.observation_manager import ObservationGroupCfg, ObservationTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
@@ -41,6 +43,7 @@ from mjlab_microban.robot.microban_climb_constants import (
     MICROBAN_CLIMB_ROBOT_CFG,
 )
 from mjlab_microban.tasks.climbing import mdp
+from mjlab_microban.tasks.climbing.rl_cfg import MicrobanClimbingRlCfg
 from mjlab_microban.tasks.climbing.wall import WALL_CFG
 
 END_EFFECTOR_BODY_NAMES = FEET_BODY_NAMES + HANDS_BODY_NAMES
@@ -48,8 +51,15 @@ END_EFFECTOR_BODY_NAMES = FEET_BODY_NAMES + HANDS_BODY_NAMES
 # Number of future motion frames (policy steps, 50 Hz) the policy observes, as a rolling window.
 FUTURE_WINDOW_STEPS = 20
 
-# Residual variant: action scale (rad per unit action) on top of the reference joint positions.
-RESIDUAL_ACTION_SCALE = 0.25
+# Residual variant: action scale on top of the reference joint positions, as in BeyondMimic:
+# 0.25 * effort_limit / stiffness, at the current P gain (0.47 rad at kp 120, 0.06 rad at kp 1000).
+RESIDUAL_STIFFNESS_SCALE = 0.25
+
+# PD gain curriculum: the BAM firmware P gain (kp_fw) decays linearly from KP_START to KP_END over
+# KP_CURRICULUM_ITERATIONS training iterations (of num_steps_per_env policy steps each).
+KP_START = 1000.0
+KP_END = 120.0
+KP_CURRICULUM_ITERATIONS = 1000
 
 # The anchor (trunk) has to be part of the motion command bodies. As in the tracking task, the policy
 # tracks the position of the feet and hands, and the orientation of the head.
@@ -101,7 +111,7 @@ def make_microban_climbing_env_cfg(
         cfg.actions["joint_pos"] = mdp.ResidualJointPositionActionCfg(
             entity_name=joint_pos_action.entity_name,
             actuator_names=joint_pos_action.actuator_names,
-            scale=RESIDUAL_ACTION_SCALE,
+            stiffness_scale=RESIDUAL_STIFFNESS_SCALE,
             command_name="motion",
         )
     else:
@@ -204,6 +214,18 @@ def make_microban_climbing_env_cfg(
         ),
     }
 
+    #---------------------------- Curriculum ------------------------
+    # Stiff joints first (the robot hangs on the holds more easily), then down to the real gain.
+    cfg.curriculum["pd_gains"] = CurriculumTermCfg(
+        func=mdp.pd_gain_curriculum,
+        params={
+            "kp_start": KP_START,
+            "kp_end": KP_END,
+            "num_iterations": KP_CURRICULUM_ITERATIONS,
+            "steps_per_iteration": MicrobanClimbingRlCfg.num_steps_per_env,
+        },
+    )
+
     #---------------------------- Events ----------------------------
     del cfg.events["push_robot"]
 
@@ -252,9 +274,12 @@ def make_microban_climbing_env_cfg(
     cfg.terminations["nan_detection"] = TerminationTermCfg(func=envs_mdp.nan_detection)
 
     #---------------------------- Viewer ----------------------------
+    # Camera on the robot's side of the wall, looking straight at the holds (+x), ~1.5 m from the wall.
+    # It tracks the trunk (x ~ -0.12 m), so the horizontal offset is 1.5 - 0.12 = 1.38 m.
     cfg.viewer.body_name = "trunk"
-    cfg.viewer.distance = 1.0
-    cfg.viewer.azimuth = 20.0  # in front of the robot (wall side), so the robot is visible
+    cfg.viewer.azimuth = 0.0  # looking along +x, towards the wall
+    cfg.viewer.elevation = -20.0  # from above: the camera is ~0.5 m above the trunk
+    cfg.viewer.distance = 1.38 / math.cos(math.radians(-cfg.viewer.elevation))
 
     #---------------------------- State estimation ------------------
     if not has_state_estimation:
@@ -275,5 +300,6 @@ def make_microban_climbing_env_cfg(
         motion_cmd.pose_range = {}
         motion_cmd.velocity_range = {}
         motion_cmd.sampling_mode = "start"
+        cfg.curriculum["pd_gains"].params["num_iterations"] = 0  # the final gain from the start
 
     return cfg
