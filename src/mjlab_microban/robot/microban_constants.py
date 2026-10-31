@@ -18,8 +18,8 @@ from mjlab.utils.spec_config import CollisionCfg
 MICROBAN_XML: Path = Path(os.path.dirname(__file__)) / "microban" / "robot.xml"
 assert MICROBAN_XML.exists(), f"XML not found: {MICROBAN_XML}"
 # Same robot with the collision approximation of the climbing model (hulls and servo boxes), used through
-# get_hulls_spec() / MICROBAN_HULLS_ROBOT_CFG. MICROBAN_XML and MICROBAN_ROBOT_CFG (primitive collisions)
-# are left as they were, for supermimic.
+# get_hulls_spec() / MICROBAN_HULLS_ROBOT_CFG. MICROBAN_XML and MICROBAN_ROBOT_CFG keep the primitive
+# collisions.
 MICROBAN_HULLS_XML: Path = MICROBAN_XML.parent / "robot_hulls.xml"
 assert MICROBAN_HULLS_XML.exists(), f"XML not found: {MICROBAN_HULLS_XML}"
 

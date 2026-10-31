@@ -28,7 +28,6 @@ from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.envs import mdp as envs_mdp
 from mjlab.envs.mdp import dr
 from mjlab.envs.mdp.actions import JointPositionActionCfg
-from mjlab.managers.curriculum_manager import CurriculumTermCfg
 from mjlab.managers.event_manager import EventTermCfg
 from mjlab.managers.observation_manager import ObservationGroupCfg, ObservationTermCfg
 from mjlab.managers.reward_manager import RewardTermCfg
@@ -48,10 +47,10 @@ from mjlab_microban.robot.microban_climb_constants import (
     MICROBAN_CLIMB_ROBOT_CFG,
 )
 from mjlab_microban.tasks.climbing import mdp
-from mjlab_microban.tasks.climbing.rl_cfg import MicrobanClimbingRlCfg
 from mjlab_microban.tasks.climbing.wall import (
     COLLISION_HANDLES,
     COLLISION_WORLD,
+    ONE_BOX_BODY,
     WallSpec,
     hold_positions,
     make_wall_cfg,
@@ -64,6 +63,9 @@ END_EFFECTOR_BODY_NAMES = FEET_BODY_NAMES + HANDS_BODY_NAMES
 # Number of future motion frames (policy steps, 50 Hz) the policy observes, as a rolling window.
 FUTURE_WINDOW_STEPS = 20
 
+# Policy steps of history of the actor's proprioceptive terms (the current one and the 4 before it, 0.1 s).
+ACTOR_HISTORY_STEPS = 5
+
 # Future frames (policy steps ahead) of the critic's motion window and contact schedule: three stages,
 # sparser further ahead (every step, every 2nd, every 4th), 0.36 s in total.
 CRITIC_FUTURE_OFFSETS = (1, 2, 3, 4, 6, 8, 10, 14, 18)
@@ -72,14 +74,16 @@ CRITIC_FUTURE_OFFSETS = (1, 2, 3, 4, 6, 8, 10, 14, 18)
 EXPECTED_CONTACT_THRESHOLD = 0.003
 
 # Residual variant: action scale on top of the reference joint positions, as in BeyondMimic:
-# 0.25 * effort_limit / stiffness, at the current P gain (0.47 rad at kp 120, 0.06 rad at kp 1000).
+# 0.25 * effort_limit / stiffness, at the P gain (0.47 rad at kp 120).
 RESIDUAL_STIFFNESS_SCALE = 0.25
 
-# PD gain curriculum: the BAM firmware P gain (kp_fw) decays linearly from KP_START to KP_END over
-# KP_CURRICULUM_ITERATIONS training iterations (of num_steps_per_env policy steps each).
-KP_START = 1000.0
-KP_END = 120.0
-KP_CURRICULUM_ITERATIONS = 1000
+# Exponential torque barrier: penalty exp((u - 0.95) / 0.0125) - 1 per joint once the motor uses more than 95 % of its
+# available torque u (0 below; 53.6 at saturation).
+TORQUE_BARRIER_THRESHOLD = 0.95
+TORQUE_BARRIER_SHARPNESS = 0.0125
+
+# BAM firmware P gain (kp_fw), fixed for the whole training.
+KP = 120.0
 
 # DeepMimic's humanoid is ~5x Microban's size (pelvis ~0.9 m vs trunk ~0.2 m): its length-based reward
 # kernels are rescaled by this factor (root std 0.063 m).
@@ -185,12 +189,21 @@ def make_microban_climbing_env_cfg(
     ball_contact_sensor_cfg = ContactSensorCfg(
         name="ball_contact",
         primary=ContactMatch(mode="geom", pattern=BALL_GEOM_NAMES, entity="robot"),
-        secondary=ContactMatch(mode="body", pattern="wall", entity="wall"),
+        secondary=ContactMatch(mode="subtree", pattern="wall", entity="wall"),  # with the 1-box blocks' body
         fields=("found", "force"),
         reduce="netforce",  # net force on each ball, world frame
         num_slots=1,
     )
-    cfg.scene.sensors = (self_collision_sensor_cfg, ball_contact_sensor_cfg)
+    # The balls on the 1-box blocks (the holds the motion does not use): penalised.
+    ball_block_contact_sensor_cfg = ContactSensorCfg(
+        name="ball_block_contact",
+        primary=ContactMatch(mode="geom", pattern=BALL_GEOM_NAMES, entity="robot"),
+        secondary=ContactMatch(mode="body", pattern=ONE_BOX_BODY, entity="wall"),
+        fields=("found",),
+        reduce="none",
+        num_slots=1,
+    )
+    cfg.scene.sensors = (self_collision_sensor_cfg, ball_contact_sensor_cfg, ball_block_contact_sensor_cfg)
 
     #---------------------------- Actions ---------------------------
     joint_pos_action = cfg.actions["joint_pos"]
@@ -238,6 +251,10 @@ def make_microban_climbing_env_cfg(
         "projected_gravity": ObservationTermCfg(
             func=envs_mdp.projected_gravity, noise=Unoise(n_min=-0.05, n_max=0.05)
         ),
+        # Heading since the episode start, wound up, from a random offset in [0, 2 pi): (cos, sin).
+        "base_yaw": ObservationTermCfg(
+            func=mdp.base_yaw_windup_cos_sin, params={"offset_range": (0.0, 2.0 * math.pi)}
+        ),
         "joint_pos": actor_terms["joint_pos"],
         "joint_vel": actor_terms["joint_vel"],
         "actions": actor_terms["actions"],
@@ -246,6 +263,11 @@ def make_microban_climbing_env_cfg(
             params={"command_name": "motion", "num_steps": FUTURE_WINDOW_STEPS},
         ),
     }
+    # Short history of the proprioceptive terms (the MLP has no memory otherwise). The command is already a
+    # future window of the reference, so it is not stacked.
+    for name, term in cfg.observations["actor"].terms.items():
+        if name != "command":
+            cfg.observations["actor"].terms[name] = replace(term, history_length=ACTOR_HISTORY_STEPS)
 
     # Privileged critic observations: world placement (position relative to the env origin, and
     # orientation) of the robot's trunk and of the reference trunk. The wall is fixed in the env frame,
@@ -286,6 +308,8 @@ def make_microban_climbing_env_cfg(
     )
     # - the applied joint torques.
     critic_terms["joint_torques"] = ObservationTermCfg(func=mdp.applied_joint_torques)
+    # - the heading, privileged: rotation about the board's z axis relative to the board, no offset: (cos, sin).
+    critic_terms["base_yaw"] = ObservationTermCfg(func=mdp.base_yaw_rel_board_cos_sin, params={"board_name": "wall"})
 
     #---------------------------- Rewards ---------------------------
     # Imitation: DeepMimic's reward (Peng et al., SIGGRAPH 2018), the standard reward for policies tracking
@@ -326,6 +350,18 @@ def make_microban_climbing_env_cfg(
             weight=-0.05,
             params={"asset_cfg": SceneEntityCfg("robot", actuator_names=(".*",))},
         ),
+        # Exponential barrier past 95 % of the available motor torque (BAM: velocity and battery dependent).
+        "torque_barrier": RewardTermCfg(
+            func=mdp.motor_torque_exp_barrier,
+            weight=-0.05,
+            params={"threshold": TORQUE_BARRIER_THRESHOLD, "sharpness": TORQUE_BARRIER_SHARPNESS},
+        ),
+        # Small penalty per ball (hand / foot sphere) touching a 1-box block, i.e. a hold the motion does not use.
+        "ball_on_unused_hold": RewardTermCfg(
+            func=mdp.contact_count,
+            weight=-0.5,
+            params={"sensor_name": ball_block_contact_sensor_cfg.name},
+        ),
         "joint_limit": RewardTermCfg(
             func=tracking_mdp.joint_pos_limits,
             weight=-10.0,
@@ -338,20 +374,11 @@ def make_microban_climbing_env_cfg(
         ),
     }
 
-    #---------------------------- Curriculum ------------------------
-    # Stiff joints first (the robot hangs on the holds more easily), then down to the real gain.
-    cfg.curriculum["pd_gains"] = CurriculumTermCfg(
-        func=mdp.pd_gain_curriculum,
-        params={
-            "kp_start": KP_START,
-            "kp_end": KP_END,
-            "num_iterations": KP_CURRICULUM_ITERATIONS,
-            "steps_per_iteration": MicrobanClimbingRlCfg.num_steps_per_env,
-        },
-    )
-
     #---------------------------- Events ----------------------------
     del cfg.events["push_robot"]
+
+    # Fixed BAM firmware P gain, for all envs.
+    cfg.events["pd_gains"] = EventTermCfg(func=mdp.set_pd_gain, mode="startup", params={"kp": KP})
 
     # Put each env's wall at its env origin (the wall is a mocap body).
     cfg.events["reset_wall"] = EventTermCfg(
@@ -425,6 +452,5 @@ def make_microban_climbing_env_cfg(
         motion_cmd.pose_range = {}
         motion_cmd.velocity_range = {}
         motion_cmd.sampling_mode = "start"
-        cfg.curriculum["pd_gains"].params["num_iterations"] = 0  # the final gain from the start
 
     return cfg

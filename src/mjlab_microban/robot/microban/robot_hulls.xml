@@ -12,8 +12,7 @@ http://www.apache.org/licenses/LICENSE-2.0
 <!-- robot.xml with the collision approximation of ../microban_climb/robot_climb.xml (convex-decomposition
      hulls and XL330 servo boxes, named "<side>_<segment>_<part>[_NN]_collision"); the chest, trunk top and head
      differ between the two robots and collide with the convex hull of their own mesh. The forearm and foot
-     primitives are replaced by spheres in microban_constants.get_spec(). Used by the mjlab envs only:
-     supermimic loads robot.xml. -->
+     primitives are replaced by spheres in microban_constants.get_spec(). -->
 <!-- Onshape https://cad.onshape.com/documents/d424992a192a8ce34ffce163/v/d1df625a85f2de984257464b/e/b34620a03cc3a684006c5867 -->
 <mujoco model="microban">
   <compiler angle="radian" meshdir="assets" autolimits="true"/>

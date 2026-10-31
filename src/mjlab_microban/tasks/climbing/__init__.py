@@ -10,7 +10,10 @@ from mjlab.tasks.registry import register_mjlab_task
 from mjlab.tasks.tracking.rl import MotionTrackingOnPolicyRunner
 
 from mjlab_microban.tasks.climbing.microban_climbing_env_cfg import make_microban_climbing_env_cfg
+from mjlab_microban.tasks.climbing.microban_climbing_conv1d_env_cfg import make_microban_climbing_conv1d_env_cfg
 from mjlab_microban.tasks.climbing.rl_cfg import (
+    MicrobanClimbingConv1dRlCfg,
+    MicrobanClimbingResidualConv1dRlCfg,
     MicrobanClimbingResidualRlCfg,
     MicrobanClimbingRlCfg,
 )
@@ -44,5 +47,22 @@ register_mjlab_task(
     env_cfg=make_microban_climbing_env_cfg(has_state_estimation=False, residual=True),
     play_env_cfg=make_microban_climbing_env_cfg(has_state_estimation=False, residual=True, play=True),
     rl_cfg=MicrobanClimbingResidualRlCfg,
+    runner_cls=MotionTrackingOnPolicyRunner,
+)
+
+# Conv1d variants: dense 1 s future reference windows, encoded by 1D convolutions.
+register_mjlab_task(
+    task_id="Mjlab-Climbing-Microban-Conv1d",
+    env_cfg=make_microban_climbing_conv1d_env_cfg(),
+    play_env_cfg=make_microban_climbing_conv1d_env_cfg(play=True),
+    rl_cfg=MicrobanClimbingConv1dRlCfg,
+    runner_cls=MotionTrackingOnPolicyRunner,
+)
+
+register_mjlab_task(
+    task_id="Mjlab-Climbing-Microban-Residual-Conv1d",
+    env_cfg=make_microban_climbing_conv1d_env_cfg(residual=True),
+    play_env_cfg=make_microban_climbing_conv1d_env_cfg(residual=True, play=True),
+    rl_cfg=MicrobanClimbingResidualConv1dRlCfg,
     runner_cls=MotionTrackingOnPolicyRunner,
 )

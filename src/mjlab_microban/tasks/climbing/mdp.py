@@ -289,13 +289,13 @@ class motion_future_window:
 
 
 # ---------------------------------------------------------------------------------------------------------
-# PD gain curriculum and stiffness-dependent action scale (BAM actuators)
+# PD gain and stiffness-dependent action scale (BAM actuators)
 # ---------------------------------------------------------------------------------------------------------
 
 
 def _bam_actuators(asset: Entity) -> list[BamActuator]:
     acts = [act for act in asset.actuators if isinstance(act, BamActuator)]
-    assert acts, "the PD gain curriculum needs BAM actuators"
+    assert acts, "the PD gain terms need BAM actuators"
     return acts
 
 
@@ -327,26 +327,62 @@ def bam_stiffness_and_effort_limit(act: BamActuator) -> tuple[float, float]:
     return kt / R * vin * bam.actuator.error_gain, effort_limit
 
 
-def pd_gain_curriculum(
+def set_pd_gain(
     env: ManagerBasedRlEnv,
-    env_ids: torch.Tensor | slice,
-    kp_start: float,
-    kp_end: float,
-    num_iterations: int,
-    steps_per_iteration: int,
+    env_ids: torch.Tensor | slice | None,
+    kp: float,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> None:
+    """Set the firmware P gain (kp_fw units) of all BAM actuators, for all envs (startup event)."""
+    set_bam_kp(env.scene[asset_cfg.name], kp)
+
+
+def bam_torque_utilisation(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG) -> torch.Tensor:
+    """Fraction of the currently available motor torque used by each BAM actuator, in [0, 1], shape [B, J].
+
+    It follows BAM's firmware law (BamActuator.compute): torque = kt/R * (vin * duty - kt * kd_scale * vel), with the
+    duty clipped to +-max_pwm, then clipped to +-max_current * kt. So the torque available in the direction the motor
+    pushes shrinks with the back-EMF when it pushes along the joint velocity and grows against it:
+        available = min(max_current * kt, kt/R * (vin * max_pwm - sign(torque) * kt * kd_scale * vel)).
+    Torques are the motor torques (before joint friction) of the last physics substep, and vin the per-env battery
+    voltage minus its load drop.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    out = []
+    for act in _bam_actuators(asset):
+        bam, cfg = act._bam_model, act.cfg
+        kt, R, max_pwm = bam.kt.value, bam.R.value, bam.actuator.max_pwm
+        torque = act._prev_motor_torque  # [B, J]
+        vin = act.vin_tensor  # [B, 1]
+        if act.vin_drop_gain is not None:
+            vin = vin - act.vin_drop_gain * torque.abs().sum(dim=-1, keepdim=True)
+            if cfg.vin_min is not None:
+                vin = torch.clamp(vin, min=cfg.vin_min)
+        vel = env.sim.data.qvel[:, act._dof_ids]
+        available = kt / R * (vin * max_pwm - torch.sign(torque) * kt * act.kd_scale * vel)
+        if cfg.max_current is not None:
+            available = torch.clamp(available, max=cfg.max_current * kt)
+        # Back-EMF can leave (almost) nothing available: then any torque in that direction is at the limit.
+        out.append(torch.clamp(torque.abs() / available.clamp(min=1e-6), max=1.0))
+    return torch.cat(out, dim=-1)
+
+
+def motor_torque_exp_barrier(
+    env: ManagerBasedRlEnv,
+    threshold: float = 0.95,
+    sharpness: float = 0.0125,
     asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
 ) -> torch.Tensor:
-    """Linear decay of the firmware P gain from kp_start to kp_end over num_iterations training iterations.
-
-    A training iteration is ``steps_per_iteration`` policy steps (the runner's num_steps_per_env);
-    ``env.common_step_counter`` is restored on resume, so is the curriculum. The gain is set for all envs
-    (the curriculum manager runs on every reset). It is not observed by the policy.
-    """
-    iteration = env.common_step_counter / steps_per_iteration
-    frac = min(iteration / num_iterations, 1.0) if num_iterations > 0 else 1.0
-    kp = kp_start + (kp_end - kp_start) * frac
-    set_bam_kp(env.scene[asset_cfg.name], kp)
-    return torch.tensor(kp)
+    """Exponential barrier on the motor torque utilisation u (bam_torque_utilisation), summed over the joints:
+        exp(max(u - threshold, 0) / sharpness) - 1.
+    0 below the threshold (95 % of the available torque), continuous there, and growing exponentially up to the
+    limit: with sharpness 0.0125, e^4 - 1 = 53.6 per joint at saturation."""
+    u = bam_torque_utilisation(env, asset_cfg)
+    cost = torch.exp(torch.clamp(u - threshold, min=0.0) / sharpness) - 1.0
+    cost = torch.nan_to_num(cost, nan=0.0)
+    env.extras["log"]["Metrics/torque_utilisation_max"] = torch.nan_to_num(u).amax(dim=-1).mean()
+    env.extras["log"]["Metrics/torque_over_threshold_frac"] = (u > threshold).float().mean()
+    return cost.sum(dim=-1)
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -466,6 +502,13 @@ class motion_tracking_errors_b:
         return quat_apply(q_inv, err_w).reshape(err_w.shape[0], -1)
 
 
+def contact_count(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tensor:
+    """Number of the sensor's primaries (e.g. balls) in contact with its secondary."""
+    sensor: ContactSensor = env.scene[sensor_name]
+    assert sensor.data.found is not None
+    return (sensor.data.found > 0).float().sum(dim=-1)
+
+
 def applied_joint_torques(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG) -> torch.Tensor:
     """Torques applied by the actuators [Nm]."""
     asset: Entity = env.scene[asset_cfg.name]
@@ -504,7 +547,7 @@ class ResidualJointPositionActionCfg(JointPositionActionCfg):
 
     With ``stiffness_scale`` set, ``scale`` is ignored and the action scale is BeyondMimic's
     ``stiffness_scale * effort_limit / stiffness``, recomputed every step from each env's current BAM P gain
-    (so it follows the PD gain curriculum).
+    (so it follows any change of the gain).
     """
 
     command_name: str = "motion"
@@ -565,3 +608,87 @@ def motion_anchor_pose_w(env: ManagerBasedRlEnv, command_name: str) -> torch.Ten
     orientation."""
     command = cast(MotionCommand, env.command_manager.get_term(command_name))
     return _pose_w(command.anchor_pos_w, command.anchor_quat_w, env)
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Heading (rotation about z) observations
+# ---------------------------------------------------------------------------------------------------------
+# An angle is fed to the networks as (cos, sin) rather than as the raw angle or its sine alone: the raw angle
+# jumps at +-pi, and sin alone is ambiguous (sin(a) = sin(pi - a)) and loses resolution around +-pi/2. The 2D
+# (cos, sin) point on the unit circle is the continuous representation of SO(2) (Zhou et al., "On the Continuity
+# of Rotation Representations in Neural Networks", CVPR 2019 -- whose 6D representation, used above for full
+# orientations, is the SO(3) counterpart), and is the usual heading encoding in legged / humanoid RL.
+
+
+def _yaw_from_quat(quat: torch.Tensor) -> torch.Tensor:
+    """Rotation about z (rad, in (-pi, pi]) of wxyz quaternions."""
+    w, x, y, z = quat.unbind(-1)
+    return torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
+def _cos_sin(angle: torch.Tensor) -> torch.Tensor:
+    return torch.stack([torch.cos(angle), torch.sin(angle)], dim=-1)
+
+
+class base_yaw_windup_cos_sin:
+    """Actor heading: the trunk's rotation about z since the start of the episode, plus a random offset, as
+    (cos, sin).
+
+    The angle is wound up: every step adds the (wrapped) yaw increment of the trunk to an unbounded accumulator,
+    so it is continuous across +-pi and counts full turns (as an IMU-integrated heading would). On reset the
+    accumulator starts at a random offset in [offset_range), by default a full turn, so the policy cannot rely on
+    the absolute heading -- only on how it changes, as with a real IMU whose yaw reference is arbitrary. The
+    reference yaw is taken lazily on the first observation after a reset, i.e. after the motion command has
+    written the episode's initial state.
+    """
+
+    def __init__(self, cfg, env: ManagerBasedRlEnv):
+        lo, hi = cfg.params.get("offset_range", (0.0, 2.0 * math.pi))
+        self.offset_range = (float(lo), float(hi))
+        self.windup = torch.zeros(env.num_envs, device=env.device)
+        self.prev_yaw = torch.zeros(env.num_envs, device=env.device)
+        self.needs_init = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+
+    def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+        if env_ids is None:
+            env_ids = slice(None)
+        self.needs_init[env_ids] = True
+
+    def __call__(
+        self,
+        env: ManagerBasedRlEnv,
+        offset_range: tuple[float, float] = (0.0, 2.0 * math.pi),
+        asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    ) -> torch.Tensor:
+        asset: Entity = env.scene[asset_cfg.name]
+        yaw = _yaw_from_quat(asset.data.root_link_quat_w)
+        init = self.needs_init
+        if init.any():
+            lo, hi = self.offset_range
+            offset = torch.rand(int(init.sum()), device=yaw.device) * (hi - lo) + lo
+            self.windup[init] = offset
+            self.prev_yaw[init] = yaw[init]
+            self.needs_init[:] = False
+        # Wrapped increment (|delta| < pi per 20 ms step), accumulated without wrapping. Non-finite yaws (blown-up
+        # envs, reset right after) do not poison the accumulator.
+        delta = torch.atan2(torch.sin(yaw - self.prev_yaw), torch.cos(yaw - self.prev_yaw))
+        delta = torch.nan_to_num(delta, nan=0.0, posinf=0.0, neginf=0.0)
+        self.windup += delta
+        self.prev_yaw = torch.where(torch.isfinite(yaw), yaw, self.prev_yaw)
+        return _cos_sin(self.windup)
+
+
+def base_yaw_rel_board_cos_sin(
+    env: ManagerBasedRlEnv,
+    board_name: str = "wall",
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> torch.Tensor:
+    """Privileged heading: the trunk's rotation about the board's z axis, relative to the board, as (cos, sin).
+
+    Exact and drift-free (no episode offset): the trunk orientation is expressed in the board frame and its yaw
+    taken there, so it is 0 when the trunk faces the board as in the start pose.
+    """
+    asset: Entity = env.scene[asset_cfg.name]
+    board: Entity = env.scene[board_name]
+    q_rel = quat_mul(quat_inv(board.data.root_link_quat_w), asset.data.root_link_quat_w)
+    return _cos_sin(_yaw_from_quat(q_rel))

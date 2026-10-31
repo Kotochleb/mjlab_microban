@@ -10,7 +10,12 @@
 # Train the Microban climbing task: tracking of a climb planned by rock-climbing-workshop on a climbing_sim wall.
 #
 # Usage:
-#   src/mjlab_microban/scripts/train_climbing.sh [motion.npz|planner.npz] [extra train args...]
+#   src/mjlab_microban/scripts/train_climbing.sh [--policy mlp|conv1d] [motion.npz|planner.npz] [extra train args...]
+#
+# --policy selects the policy's view of the future reference (default: mlp, or $POLICY):
+#   mlp     the TASK as is: the future reference frames are flat inputs of the MLP;
+#   conv1d  TASK's Conv1d variant (TASK-Conv1d): dense 1 s windows of the future reference, encoded by 1D
+#           convolutions before the MLP (tasks/climbing/microban_climbing_conv1d_env_cfg.py).
 #
 # Without a file, the level 1 (seed 0) climb src/mjlab_microban/motion/l1s0.npz is used.
 # The wall (level / seed) and the holds used (5-box cups, the others 1-box blocks) are read by the env from
@@ -22,17 +27,43 @@
 #              Mjlab-Climbing-Microban-No-State-Estimation, Mjlab-Climbing-Microban-Residual-No-State-Estimation)
 #   NUM_ENVS   Number of parallel environments (default: 4096)
 #   VIDEO      Record training videos (default: True)
+#   POLICY     Default of --policy (mlp)
 #
 # Examples:
 #   src/mjlab_microban/scripts/train_climbing.sh
 #   src/mjlab_microban/scripts/train_climbing.sh src/mjlab_microban/motion/l1s0_q.npz --agent.max-iterations 10000
 #   TASK=Mjlab-Climbing-Microban-Residual src/mjlab_microban/scripts/train_climbing.sh
+#   src/mjlab_microban/scripts/train_climbing.sh --policy conv1d src/mjlab_microban/motion/l1s0.npz
 
 set -euo pipefail
 
 TASK="${TASK:-Mjlab-Climbing-Microban}"
 NUM_ENVS="${NUM_ENVS:-4096}"
 VIDEO="${VIDEO:-True}"
+POLICY="${POLICY:-mlp}"
+
+# Take --policy out of the arguments (anywhere on the line); the rest goes to the motion file / train.
+ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --policy) [[ $# -ge 2 ]] || { echo "--policy needs a value: mlp or conv1d" >&2; exit 1; }; POLICY="$2"; shift 2 ;;
+    --policy=*) POLICY="${1#--policy=}"; shift ;;
+    *) ARGS+=("$1"); shift ;;
+  esac
+done
+set -- ${ARGS[@]+"${ARGS[@]}"}
+
+case "$POLICY" in
+  mlp) ;;
+  conv1d)
+    case "$TASK" in
+      Mjlab-Climbing-Microban|Mjlab-Climbing-Microban-Residual) TASK="$TASK-Conv1d" ;;
+      *-Conv1d) ;;
+      *) echo "No Conv1d variant of $TASK (there are Mjlab-Climbing-Microban[-Residual]-Conv1d)" >&2; exit 1 ;;
+    esac
+    ;;
+  *) echo "Unknown --policy $POLICY (expected mlp or conv1d)" >&2; exit 1 ;;
+esac
 
 export MUJOCO_GL=egl
 
@@ -94,7 +125,7 @@ if missing:
 print(f\"{d['wall']} ({len(d['used_holds'])} holds used)\")
 " "$MOTION_FILE")"
 
-echo "[INFO] Training $TASK with $NUM_ENVS envs on $MOTION_FILE, wall $WALL"
+echo "[INFO] Training $TASK ($POLICY policy) with $NUM_ENVS envs on $MOTION_FILE, wall $WALL"
 exec uv run train "$TASK" \
   --env.scene.num-envs "$NUM_ENVS" \
   --env.commands.motion.motion-file "$MOTION_FILE" \

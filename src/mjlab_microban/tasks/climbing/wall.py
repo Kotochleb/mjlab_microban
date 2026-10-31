@@ -69,6 +69,8 @@ HOLD_FRICTION = 0.5  # climbing_sim.scene.build_spec's default
 COLLISION_WORLD = 1
 COLLISION_SELF = 2
 COLLISION_HANDLES = 4
+# Body (child of "wall") carrying the 1-box blocks of the holds the motion does not use.
+ONE_BOX_BODY = "one_box_blocks"
 # 5-box cup boxes in the WORLD group (besides HANDLES): the front of the cup.
 FIVE_BOX_WORLD_BOXES = ("lip",)
 
@@ -298,6 +300,9 @@ def get_spec(spec: WallSpec, used: frozenset[int] | None = None) -> mujoco.MjSpe
     )
 
     quat = SIM_TO_ENV_QUAT.tolist()
+    # The 1-box blocks are on a child body of the wall (fixed to it, no joint), so that a contact sensor can single
+    # them out (ONE_BOX_BODY: the climbing env penalises the balls touching them).
+    blocks_body = body.add_body(name=ONE_BOX_BODY)
     for k, hold in enumerate(wall.holds):
         socket = sim_to_env(hold.socket)
         name = f"hold{k}_c{hold.col}_r{hold.row}"
@@ -317,7 +322,7 @@ def get_spec(spec: WallSpec, used: frozenset[int] | None = None) -> mujoco.MjSpe
             _add_hold_boxes(body, name, socket, hold_boxes.FIVE_BOX, friction, rgba=[0.25, 0.55, 0.95, 1],
                             conaffinity=_five_box_conaffinity)
         else:
-            _add_hold_boxes(body, name, socket, hold_boxes.ONE_BOX, friction, rgba=[0.7, 0.3, 0.85, 1],
+            _add_hold_boxes(blocks_body, name, socket, hold_boxes.ONE_BOX, friction, rgba=[0.7, 0.3, 0.85, 1],
                             conaffinity=_one_box_conaffinity)
     return mj
 
