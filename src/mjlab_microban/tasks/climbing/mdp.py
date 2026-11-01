@@ -1314,11 +1314,13 @@ def contact_count(env: ManagerBasedRlEnv, sensor_name: str) -> torch.Tensor:
 
 
 class hold_bottom_contact:
-    """Number of the sensor's primaries (balls / capsules) touching the bottom of a hold, from below.
+    """Number of the sensor's primaries (balls / capsules) touching the bottom of a hold, from below, or, with
+    ``include_sides``, hitting its sides or front from the outside.
 
     Penalised, per contact: the hold is above the geom, n_z > cos_threshold (hold frame, hold_boxes.py: x along
-    the wall, y into the wall, z up; ``normal`` points from the robot geom to the hold). Every other contact (top,
-    inside of a cup, sides, front) is allowed. Only contacts within ``margin`` of the extents of the nearest
+    the wall, y into the wall, z up; ``normal`` points from the robot geom to the hold). With ``include_sides``,
+    also a mostly horizontal normal (|n_xy| > cos_threshold) pointing towards the socket: an outer face of the hold
+    (its sides, its front) hit from the outside. Every other contact (top, inside of a cup) is allowed. Only contacts within ``margin`` of the extents of the nearest
     hold (the contact point relative to its socket) count, e.g. not the board.
 
     The sensor: primaries the robot geoms, secondary the wall subtree, fields ("pos", "normal"), any reduce;
@@ -1348,6 +1350,7 @@ class hold_bottom_contact:
         cos_threshold: float = 0.7,
         margin: float = 0.003,
         wall_name: str = "wall",
+        include_sides: bool = False,
     ) -> torch.Tensor:
         del margin
         sensor: ContactSensor = env.scene[sensor_name]
@@ -1365,10 +1368,17 @@ class hold_bottom_contact:
 
         on_hold = ((rel >= self.lo) & (rel <= self.hi)).all(dim=-1)
         below = valid & on_hold & (n[..., 2] > cos_threshold)  # [B, N * S]
+        hit = below
+        if include_sides:
+            inward = (n[..., :2] * rel[..., :2]).sum(dim=-1) < 0  # normal towards the socket: an outer face
+            side = valid & on_hold & (n[..., :2].norm(dim=-1) > cos_threshold) & inward
+            side = side.view(B, -1, num_slots).any(dim=-1)  # [B, N]
+            env.extras["log"]["Metrics/hold_side_contact"] = side.any(-1).float().mean()
+            hit = hit | side.repeat_interleave(num_slots, dim=-1)
 
         below = below.view(B, -1, num_slots).any(dim=-1)  # [B, N]
         env.extras["log"]["Metrics/hold_bottom_contact"] = below.any(-1).float().mean()
-        return below.float().sum(dim=-1)
+        return hit.view(B, -1, num_slots).any(dim=-1).float().sum(dim=-1)
 
 
 class ball_in_hold_contact:

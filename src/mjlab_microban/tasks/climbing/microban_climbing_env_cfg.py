@@ -486,14 +486,16 @@ def make_microban_climbing_env_cfg(
             weight=-0.5,
             params={"sensor_name": ball_block_contact_sensor_cfg.name},
         ),
-        # Penalty per ball / capsule touching the bottom of a hold, from below (any other contact is allowed).
+        # Penalty per ball / capsule touching the bottom of a hold from below, or hitting its sides / front from the
+        # outside (contacts inside a cup or on top of a hold are allowed).
         "hold_bottom_contact": RewardTermCfg(
             func=mdp.hold_bottom_contact,
-            weight=-1.5,
+            weight=-6.0,
             params={
                 "sensor_name": grip_hold_contact_sensor_cfg.name,
                 "num_slots": GRIP_HOLD_CONTACT_SLOTS,
                 "cos_threshold": 0.7,
+                "include_sides": True,
             },
         ),
         # Bonus per ball seated in a cup (on its floor from above, or against its walls from the inside, never on a
