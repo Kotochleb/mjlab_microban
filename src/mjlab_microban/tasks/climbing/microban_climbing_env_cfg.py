@@ -140,6 +140,8 @@ START_JOINT_POS = {
 # The model's own pose (qpos0: this trunk position, all joints at 0) is what the simulation is first evaluated in,
 # and mujoco_warp checks its constraint rows against njmax: it is kept out of the wall's reach (x < 0.2 m).
 QPOS0_TRUNK_X = -0.25
+# [m] the robot's spawn height above its reference on every reset (see HoldEndMotionCommandCfg.spawn_z_offset).
+SPAWN_Z_OFFSET = 0.002
 
 
 def _robot_spec_fn(get_spec, trunk_pos):
@@ -301,22 +303,14 @@ def make_microban_climbing_env_cfg(
     cfg.commands["motion"] = motion_cmd
     motion_cmd.anchor_body_name = "trunk"
     motion_cmd.body_names = TRACKED_BODY_NAMES
-    motion_cmd.pose_range = {
-        "x": (-0.015, 0.015),
-        "y": (-0.015, 0.015),
-        "z": (-0.005, 0.005),
-        "roll": (-0.1, 0.1),
-        "pitch": (-0.1, 0.1),
-        "yaw": (-0.2, 0.2),
-    }
-    motion_cmd.velocity_range = {
-        "x": (-0.3, 0.3),
-        "y": (-0.3, 0.3),
-        "z": (-0.1, 0.1),
-        "roll": (-0.52, 0.52),
-        "pitch": (-0.52, 0.52),
-        "yaw": (-0.78, 0.78),
-    }
+    # Resets: the reference's exact state at the sampled time step (no pose, velocity or joint noise), lifted by
+    # SPAWN_Z_OFFSET so that the balls start just above the cups rather than in collision with them.
+    motion_cmd.spawn_z_offset = SPAWN_Z_OFFSET
+    # Only from frames where the contact plan has all four balls on holds.
+    motion_cmd.spawn_contact_limbs = tuple(name.removesuffix("_ball") for name in BALL_SITE_NAMES)
+    motion_cmd.pose_range = {}
+    motion_cmd.velocity_range = {}
+    motion_cmd.joint_position_range = (0.0, 0.0)
 
     #---------------------------- Observations ----------------------
     # Actor: proprioception only (as the velocity task), and as command the future reference joint

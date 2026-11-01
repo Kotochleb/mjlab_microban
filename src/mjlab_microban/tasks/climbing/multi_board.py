@@ -59,7 +59,15 @@ from mjlab.tasks.tracking.mdp import MotionCommand
 from mjlab.tasks.tracking.mdp.commands import MotionLoader
 from mjlab.utils.lab_api.math import quat_from_euler_xyz, quat_mul, sample_uniform
 
-from mjlab_microban.tasks.climbing.mdp import HoldEndMotionCommandCfg, hold_final_frame, motion_contact_schedule
+from mjlab_microban.tasks.climbing.mdp import (
+    HoldEndMotionCommandCfg,
+    full_contact_frames,
+    full_contact_stances,
+    hold_final_frame,
+    lift_spawn,
+    motion_contact_schedule,
+    snap_to_stance,
+)
 from mjlab_microban.tasks.climbing.wall import (
     WallSpec,
     get_multi_board_spec,
@@ -253,6 +261,16 @@ class MultiBoardMotionCommand(MotionCommand):
         starts = np.concatenate([[0], np.cumsum(np.array(lengths) + cfg.segment_padding)[:-1]])
         self.segment_start = torch.tensor(starts, dtype=torch.long, device=self.device)  # [nb]
         self.segment_length = torch.tensor(lengths, dtype=torch.long, device=self.device)  # [nb], unpadded
+        # Full-contact stances (spawn_contact_limbs), per board within its own segment, as frames of the concatenation.
+        self.stance_lo = self.stance_hi = None
+        if cfg.spawn_contact_limbs:
+            lo = np.zeros(self.motion.time_step_total, dtype=np.int64)
+            hi = np.zeros_like(lo)
+            for f, start, n in zip(cfg.motion_files, starts, lengths, strict=True):
+                c = full_contact_frames(f, n, cfg.spawn_contact_limbs)
+                lo[start : start + n], hi[start : start + n] = (x + start for x in full_contact_stances(c, f))
+            self.stance_lo = torch.tensor(lo, device=self.device)
+            self.stance_hi = torch.tensor(hi, device=self.device)
 
         self.board_origins = torch.tensor(cfg.board_offsets, dtype=torch.float32, device=self.device)  # [nb, 3]
         self.board_levels = torch.tensor(cfg.board_levels, dtype=torch.long, device=self.device)  # [nb]
@@ -378,6 +396,9 @@ class MultiBoardMotionCommand(MotionCommand):
         # MotionCommand._resample_command, with the time step sampled on each env's board.
         board = self.board_ids[env_ids]
         local = self._sample_local_steps(env_ids, board)
+        if self.stance_lo is not None and self.cfg.sampling_mode != "start":
+            local = snap_to_stance(self.segment_start[board] + local, self.stance_lo, self.stance_hi)
+            local = local - self.segment_start[board]
         self.time_steps[env_ids] = self.segment_start[board] + local
         self.metrics["board"][env_ids] = board.float()
         # The episode's limit: its board's horizon, at most the rest of the motion (to the end of its final hold).
@@ -426,6 +447,9 @@ class MultiBoardMotionCommand(MotionCommand):
                 + (1 - self.cfg.adaptive_alpha) * self.bin_failed_count
             )
             self._current_bin_failed.zero_()
+
+    def _write_reference_state_to_sim(self, env_ids, root_pos, *args, **kwargs) -> None:
+        super()._write_reference_state_to_sim(env_ids, lift_spawn(root_pos, self.cfg.spawn_z_offset), *args, **kwargs)
 
     def reset_to_frame(self, env_ids: torch.Tensor, frame: int) -> None:
         """Frame ``frame`` of each env's own board motion (clamped to its last frame), no perturbation."""

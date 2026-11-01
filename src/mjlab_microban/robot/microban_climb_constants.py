@@ -107,11 +107,13 @@ CLIMB_START_FRAME = EntityCfg.InitialStateCfg(
 
 from bam.mjlab import BamActuatorCfg  # noqa: E402
 
+from mjlab_microban.robot.backlash import ACTUATED_JOINT_EXPR  # noqa: E402
+
 # Same actuator model as the walking Microban (microban_constants.py).
 actuators = BamActuatorCfg(
     motor_name="xl330",
     model="m6",
-    target_names_expr=(r".*",),
+    target_names_expr=(ACTUATED_JOINT_EXPR,),  # not the backlash joints (robot/backlash.py), passive
     kp_fw=125,
     vin_range=(7.0, 9.0),  # training: narrowed then widened by the actuator_dr curriculum
     vin_drop_gain_range=(0.0, 0.2),

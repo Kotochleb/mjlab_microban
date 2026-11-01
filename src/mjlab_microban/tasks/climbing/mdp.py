@@ -19,6 +19,7 @@ from mjlab.sensor import ContactSensor, TerrainHeightSensor
 from mjlab.tasks.tracking.mdp import MotionCommand, MotionCommandCfg
 from mjlab.utils.lab_api.math import matrix_from_quat, quat_apply, quat_error_magnitude, quat_inv, quat_mul
 
+from mjlab_microban.robot.backlash import is_backlash_joint
 from mjlab_microban.tasks.climbing import hold_boxes
 from mjlab_microban.tasks.climbing.wall import SIM_TO_ENV_ROT, contact_plan_file, planned_contacts
 
@@ -174,8 +175,7 @@ def motion_joint_pos_error_exp(
 ) -> torch.Tensor:
     """Reward tracking of the motion's joint configuration."""
     command = cast(MotionCommand, env.command_manager.get_term(command_name))
-    asset: Entity = env.scene[asset_cfg.name]
-    error = torch.sum(torch.square(command.joint_pos - asset.data.joint_pos), dim=-1)
+    error = torch.sum(torch.square(command.joint_pos - command.robot_joint_pos), dim=-1)
     return torch.exp(-error / std**2)
 
 
@@ -189,8 +189,8 @@ def deepmimic_pose_exp(
 ) -> torch.Tensor:
     """Pose reward: joint angle errors plus the root orientation error (angle), squared and summed."""
     command = cast(MotionCommand, env.command_manager.get_term(command_name))
-    asset: Entity = env.scene[asset_cfg.name]
-    joint_err = torch.sum(torch.square(command.joint_pos - asset.data.joint_pos), dim=-1)
+    # The actuated joints (motor side, ActuatedJointsMotionCommand.robot_joint_pos), as the motion's joint_pos.
+    joint_err = torch.sum(torch.square(command.joint_pos - command.robot_joint_pos), dim=-1)
     root_err = torch.square(quat_error_magnitude(command.anchor_quat_w, command.robot_anchor_quat_w))
     return torch.exp(-k * (joint_err + root_err))
 
@@ -200,8 +200,7 @@ def deepmimic_velocity_exp(
 ) -> torch.Tensor:
     """Velocity reward: joint velocity errors plus the root angular velocity error, squared and summed."""
     command = cast(MotionCommand, env.command_manager.get_term(command_name))
-    asset: Entity = env.scene[asset_cfg.name]
-    joint_err = torch.sum(torch.square(command.joint_vel - asset.data.joint_vel), dim=-1)
+    joint_err = torch.sum(torch.square(command.joint_vel - command.robot_joint_vel), dim=-1)
     root_err = torch.sum(torch.square(command.anchor_ang_vel_w - command.robot_anchor_ang_vel_w), dim=-1)
     return torch.exp(-k * (joint_err + root_err))
 
@@ -262,7 +261,72 @@ def hold_final_frame(motion, frames: int) -> None:
     motion.time_step_total = motion.joint_pos.shape[0]
 
 
-class HoldEndMotionCommand(MotionCommand):
+def actuated_joint_ids(asset: Entity) -> list[int]:
+    """Ids of the asset's actuated joints: all but the passive backlash joints (robot/backlash.py)."""
+    return [i for i, name in enumerate(asset.joint_names) if not is_backlash_joint(name)]
+
+
+class ActuatedJointsMotionCommand(MotionCommand):
+    """MotionCommand for a robot with backlash joints (robot/backlash.py): the motion's joint_pos / joint_vel are
+    those of the actuated joints only, so the robot's are read (``robot_joint_pos`` / ``robot_joint_vel``) and
+    written (reference state on resets, with the backlash joints at 0, at rest) on those joints. Without backlash
+    joints, the same as MotionCommand."""
+
+    def __init__(self, cfg: MotionCommandCfg, env: ManagerBasedRlEnv):
+        super().__init__(cfg, env)
+        ids = actuated_joint_ids(self.robot)
+        self.actuated_joint_ids = torch.tensor(ids, dtype=torch.long, device=self.device)
+        self.has_backlash = len(ids) < self.robot.num_joints
+        if self.motion.joint_pos.shape[-1] != len(ids):
+            raise ValueError(
+                f"motion {cfg.motion_file} has {self.motion.joint_pos.shape[-1]} joints, the robot {len(ids)} "
+                "actuated joints"
+            )
+
+    @property
+    def robot_joint_pos(self) -> torch.Tensor:
+        return self.robot.data.joint_pos[:, self.actuated_joint_ids]
+
+    @property
+    def robot_joint_vel(self) -> torch.Tensor:
+        return self.robot.data.joint_vel[:, self.actuated_joint_ids]
+
+    def _write_reference_state_to_sim(
+        self,
+        env_ids: torch.Tensor,
+        root_pos: torch.Tensor,
+        root_ori: torch.Tensor,
+        root_lin_vel: torch.Tensor,
+        root_ang_vel: torch.Tensor,
+        joint_pos: torch.Tensor,
+        joint_vel: torch.Tensor,
+    ) -> None:
+        if self.has_backlash:
+            full_pos = self.robot.data.default_joint_pos[env_ids].clone()  # backlash joints at 0
+            full_vel = torch.zeros_like(full_pos)
+            full_pos[:, self.actuated_joint_ids] = joint_pos
+            full_vel[:, self.actuated_joint_ids] = joint_vel
+            joint_pos, joint_vel = full_pos, full_vel
+        super()._write_reference_state_to_sim(
+            env_ids, root_pos, root_ori, root_lin_vel, root_ang_vel, joint_pos, joint_vel
+        )
+
+    def _debug_vis_impl(self, visualizer) -> None:
+        if not self.has_backlash or self.cfg.viz.mode != "ghost":
+            super()._debug_vis_impl(visualizer)
+            return
+        # The base class writes the motion's joint_pos at every joint's qpos address: give it the actuated ones'
+        # only (the ghost's backlash joints stay at 0) for the duration of the call.
+        indexing = self.robot.indexing
+        joint_q_adr = indexing.joint_q_adr
+        indexing.joint_q_adr = joint_q_adr[self.actuated_joint_ids]
+        try:
+            super()._debug_vis_impl(visualizer)
+        finally:
+            indexing.joint_q_adr = joint_q_adr
+
+
+class HoldEndMotionCommand(ActuatedJointsMotionCommand):
     """MotionCommand whose motion ends with ``end_hold_s`` [s] of its final configuration at rest."""
 
     cfg: HoldEndMotionCommandCfg
@@ -275,11 +339,75 @@ class HoldEndMotionCommand(MotionCommand):
         self.bin_count = int(self.motion.time_step_total // (1 / env.step_dt)) + 1
         self.bin_failed_count = torch.zeros(self.bin_count, dtype=torch.float, device=self.device)
         self._current_bin_failed = torch.zeros(self.bin_count, dtype=torch.float, device=self.device)
+        self.stance_lo = self.stance_hi = None
+        if cfg.spawn_contact_limbs:
+            contact = full_contact_frames(cfg.motion_file, self.motion.time_step_total, cfg.spawn_contact_limbs)
+            lo, hi = full_contact_stances(contact, cfg.motion_file)
+            self.stance_lo = torch.tensor(lo, device=self.device)
+            self.stance_hi = torch.tensor(hi, device=self.device)
+
+    def _uniform_sampling(self, env_ids: torch.Tensor):
+        super()._uniform_sampling(env_ids)
+        self._snap_time_steps(env_ids)
+
+    def _adaptive_sampling(self, env_ids: torch.Tensor):
+        super()._adaptive_sampling(env_ids)
+        self._snap_time_steps(env_ids)
+
+    def _snap_time_steps(self, env_ids: torch.Tensor) -> None:
+        if getattr(self, "stance_lo", None) is not None:  # (not yet built during MotionCommand.__init__)
+            self.time_steps[env_ids] = snap_to_stance(self.time_steps[env_ids], self.stance_lo, self.stance_hi)
+
+    def _write_reference_state_to_sim(self, env_ids, root_pos, *args, **kwargs) -> None:
+        super()._write_reference_state_to_sim(env_ids, lift_spawn(root_pos, self.cfg.spawn_z_offset), *args, **kwargs)
+
+
+def lift_spawn(root_pos: torch.Tensor, dz: float) -> torch.Tensor:
+    """The root position written to the sim on a reset, ``dz`` [m] higher than the reference (a copy)."""
+    root_pos = root_pos.clone()
+    root_pos[:, 2] += dz
+    return root_pos
+
+
+def full_contact_frames(motion_file: str, num_frames: int, limbs: tuple[str, ...]) -> np.ndarray:
+    """[num_frames] bool: the frames where the motion's contact plan has every one of ``limbs`` on a hold (frames
+    past the motion's own, e.g. the end hold: its last one)."""
+    plan_file = contact_plan_file(motion_file)
+    if not plan_file.exists():
+        raise FileNotFoundError(f"{plan_file}: no contact plan for {motion_file} (needed by spawn_contact_limbs)")
+    motion_frames = int(np.load(motion_file)["joint_pos"].shape[0])
+    contact = planned_contacts(plan_file, motion_frames, limbs).all(axis=1)
+    return np.concatenate([contact, np.full(num_frames - motion_frames, contact[-1])])
+
+
+def full_contact_stances(contact: np.ndarray, name: str = "") -> tuple[np.ndarray, np.ndarray]:
+    """For each frame t, the first and last frame [T] of the run of ``contact`` frames it is snapped to: the latest
+    run starting at or before t, or the first run if none does."""
+    on = np.flatnonzero(contact)
+    if len(on) == 0:
+        raise ValueError(f"{name}: no frame with all the limbs in contact to spawn in")
+    starts = on[np.r_[True, np.diff(on) > 1]]
+    ends = on[np.r_[np.diff(on) > 1, True]]
+    run = np.clip(np.searchsorted(starts, np.arange(len(contact)), side="right") - 1, 0, None)
+    return starts[run], ends[run]
+
+
+def snap_to_stance(t: torch.Tensor, lo: torch.Tensor, hi: torch.Tensor) -> torch.Tensor:
+    """Each sampled frame t moved to a uniformly random frame of its full-contact stance [lo[t], hi[t]]."""
+    a, b = lo[t], hi[t]
+    return torch.minimum(a + (torch.rand(t.shape, device=t.device) * (b - a + 1)).long(), b)
 
 
 @dataclass(kw_only=True)
 class HoldEndMotionCommandCfg(MotionCommandCfg):
     end_hold_s: float = 0.0  # [s] of the motion's final configuration, at rest, after its end
+    # [m] the robot is spawned above its reference on every reset (on top of pose_range), so that the balls start
+    # just above the cups instead of in them when the pose is randomised.
+    spawn_z_offset: float = 0.0
+    # Limbs (the contact plan's names, e.g. "left_hand") that have to be on holds in the frames resets start from:
+    # a sampled time step (uniform / adaptive) is moved into the stance with all of them in contact at or before it
+    # (the first one if there is none), at a random frame of it. Empty: no constraint.
+    spawn_contact_limbs: tuple[str, ...] = ()
 
     def build(self, env: ManagerBasedRlEnv) -> HoldEndMotionCommand:
         return HoldEndMotionCommand(self, env)
@@ -1290,7 +1418,8 @@ def motion_future_joint_pos(
     else:
         future = torch.tensor(offsets, dtype=torch.long, device=env.device)  # [K]
     idx = motion_frames_ahead(command, future)  # [B, K]
-    joint_pos = motion.joint_pos[idx] - asset.data.default_joint_pos[:, None]  # [B, K, J]
+    default = asset.data.default_joint_pos[:, actuated_joint_ids(asset)]  # the motion's joints: the actuated ones
+    joint_pos = motion.joint_pos[idx] - default[:, None]  # [B, K, J]
     return joint_pos.reshape(joint_pos.shape[0], -1)
 
 
