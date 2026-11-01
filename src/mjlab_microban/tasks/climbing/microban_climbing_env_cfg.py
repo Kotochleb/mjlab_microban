@@ -483,14 +483,14 @@ def make_microban_climbing_env_cfg(
         # Small penalty per ball (hand / foot sphere) touching a 1-box block, i.e. a hold the motion does not use.
         "ball_on_unused_hold": RewardTermCfg(
             func=mdp.contact_count,
-            weight=-0.5,
+            weight=-0.25,
             params={"sensor_name": ball_block_contact_sensor_cfg.name},
         ),
         # Penalty per ball / capsule touching the bottom of a hold from below, or hitting its sides / front from the
         # outside (contacts inside a cup or on top of a hold are allowed).
         "hold_bottom_contact": RewardTermCfg(
             func=mdp.hold_bottom_contact,
-            weight=-6.0,
+            weight=-3.0,
             params={
                 "sensor_name": grip_hold_contact_sensor_cfg.name,
                 "num_slots": GRIP_HOLD_CONTACT_SLOTS,
@@ -519,7 +519,7 @@ def make_microban_climbing_env_cfg(
         ),
         "self_collisions": RewardTermCfg(
             func=tracking_mdp.self_collision_cost,
-            weight=-10.0,
+            weight=-5.0,
             params={"sensor_name": self_collision_sensor_cfg.name, "force_threshold": 1.0},
         ),
     }
@@ -538,11 +538,11 @@ def make_microban_climbing_env_cfg(
     )
 
     # The balls and capsules are what touches the holds: randomise their friction (the feet's in the tracking
-    # task), sliding coefficient U(0.08, 1.3), drawn independently for each ball and capsule of each env. They have
+    # task), sliding coefficient U(0.08, 0.8), drawn independently for each ball and capsule of each env. They have
     # priority 1, so this is the friction of their contacts with the holds (and with the board / floor), not the
     # holds' HOLD_FRICTION.
     cfg.events["foot_friction"].params["asset_cfg"].geom_names = GRIP_GEOM_NAMES
-    cfg.events["foot_friction"].params["ranges"] = (0.08, 1.3)
+    cfg.events["foot_friction"].params["ranges"] = (0.08, 0.8)
     cfg.events["foot_friction"].params["shared_random"] = False
 
     cfg.events["dof_armature_randomization"] = EventTermCfg(
