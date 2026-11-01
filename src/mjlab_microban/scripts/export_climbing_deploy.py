@@ -225,6 +225,7 @@ def main() -> None:
     from mjlab_microban.robot.microban_climb_constants import BALL_SITE_NAMES
     from mjlab_microban.tasks.climbing import mdp as climb_mdp
     from mjlab_microban.tasks.climbing.microban_climbing_env_cfg import KP
+    from mjlab_microban.tasks.climbing import mdp as climbing_mdp
     from mjlab_microban.tasks.climbing.wall import hold_positions, motion_wall, sim_wall
 
     sys.path.insert(0, str(RCR_SRC))
@@ -242,6 +243,9 @@ def main() -> None:
 
     env_cfg = load_env_cfg(task, play=True)
     env_cfg.scene.num_envs = 1
+    # The training's sensing delays model the latency the robot has by itself: none here, so the parity check's
+    # robot-side controller (fed the measurements as they come) sees the env's observations.
+    climbing_mdp.strip_observation_delays(env_cfg)
     env_cfg.commands["motion"].motion_file = str(motion_file)
     if "base_yaw" in env_cfg.observations["actor"].terms:  # the robot starts its heading at 0
         env_cfg.observations["actor"].terms["base_yaw"].params["offset_range"] = (0.0, 0.0)

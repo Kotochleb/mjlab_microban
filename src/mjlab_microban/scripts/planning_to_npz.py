@@ -52,7 +52,7 @@ def main():
 
     sim_cfg = SimulationCfg()
     sim_cfg.mujoco.timestep = 1.0 / args.output_fps
-    scene = Scene(make_microban_climbing_env_cfg().scene, device=device)
+    scene = Scene(make_microban_climbing_env_cfg(fixed_head=False).scene, device=device)
     model = scene.compile()
     sim = Simulation(num_envs=1, cfg=sim_cfg, model=model, device=device)
     scene.initialize(sim.mj_model, sim.model, sim.data)

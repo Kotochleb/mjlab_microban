@@ -61,11 +61,14 @@ from mjlab.utils.lab_api.math import quat_from_euler_xyz, quat_mul, sample_unifo
 
 from mjlab_microban.tasks.climbing.mdp import (
     HoldEndMotionCommandCfg,
+    RobotJointsMotionCommand,
+    early_failures,
     full_contact_frames,
     full_contact_stances,
     hold_final_frame,
     lift_spawn,
     motion_contact_schedule,
+    select_motion_joints,
     snap_to_stance,
 )
 from mjlab_microban.tasks.climbing.wall import (
@@ -236,7 +239,7 @@ class _ConcatenatedMotion:
         self.time_step_total = self.joint_pos.shape[0]
 
 
-class MultiBoardMotionCommand(MotionCommand):
+class MultiBoardMotionCommand(RobotJointsMotionCommand):
     """MotionCommand over several boards: each env tracks the motion of its board (``board_ids``, set by
     ``set_boards``, which also moves the env origin onto the board). ``time_steps`` index the concatenated
     motion (see the module docstring); motion ends, resampling and adaptive sampling are per board."""
@@ -253,6 +256,8 @@ class MultiBoardMotionCommand(MotionCommand):
         super().__init__(cfg, env)
 
         motions = [MotionLoader(f, self.body_indexes, device=self.device) for f in cfg.motion_files]
+        for m in motions:  # the robot's joints only (no fixed head), as the base class's motion
+            select_motion_joints(m, list(self.robot.joint_names))
         self.end_hold_frames = round(cfg.end_hold_s / env.step_dt)  # each motion's final pose, held at its end
         for m in motions:
             hold_final_frame(m, self.end_hold_frames)
@@ -356,7 +361,8 @@ class MultiBoardMotionCommand(MotionCommand):
 
     def _record_failures(self, env_ids: torch.Tensor) -> None:
         """Bins (of the board each env was on: the one its time step is in) where the episodes failed."""
-        failed = self._env.termination_manager.terminated[env_ids]
+        # (not the episodes that failed right after their spawn)
+        failed = self._env.termination_manager.terminated[env_ids] & ~early_failures(self._env, env_ids)
         if not torch.any(failed):
             return
         t = self.time_steps[env_ids][failed]
@@ -524,7 +530,8 @@ class board_levels:
         del max_init_level
         command = cast(MultiBoardMotionCommand, env.command_manager.get_term(command_name))
         steps = env.episode_length_buf[env_ids]
-        ran = steps > 0  # not the first reset of the env (nothing to judge)
+        # Not the first reset of the env, nor an episode that failed right after its spawn (nothing to judge).
+        ran = (steps > 0) & ~early_failures(env, env_ids)
         # The curriculum runs at the reset, before the termination buffers are cleared and the motion resampled:
         # why each episode ended, and its limit and board.
         terms = env.termination_manager
@@ -602,7 +609,8 @@ class board_horizons:
     ) -> dict[str, torch.Tensor]:
         del min_s, max_s, init_s
         command = cast(MultiBoardMotionCommand, env.command_manager.get_term(command_name))
-        ran = env.episode_length_buf[env_ids] > 0  # not the first reset of the env (nothing to judge)
+        # Not the first reset of the env, nor an episode that failed right after its spawn (nothing to judge).
+        ran = (env.episode_length_buf[env_ids] > 0) & ~early_failures(env, env_ids)
         success = ran & ~env.termination_manager.terminated[env_ids]
         board = command.board_ids[env_ids]  # the board of the episode that ended (board_levels runs after this)
         self._episodes.index_add_(0, board, ran.float())

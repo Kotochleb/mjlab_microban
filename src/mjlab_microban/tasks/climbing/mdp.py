@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, cast
 
+import mujoco
 import numpy as np
 import torch
 import warp as wp
@@ -19,7 +21,6 @@ from mjlab.sensor import ContactSensor, TerrainHeightSensor
 from mjlab.tasks.tracking.mdp import MotionCommand, MotionCommandCfg
 from mjlab.utils.lab_api.math import matrix_from_quat, quat_apply, quat_error_magnitude, quat_inv, quat_mul
 
-from mjlab_microban.robot.backlash import is_backlash_joint
 from mjlab_microban.tasks.climbing import hold_boxes
 from mjlab_microban.tasks.climbing.wall import SIM_TO_ENV_ROT, contact_plan_file, planned_contacts
 
@@ -175,7 +176,8 @@ def motion_joint_pos_error_exp(
 ) -> torch.Tensor:
     """Reward tracking of the motion's joint configuration."""
     command = cast(MotionCommand, env.command_manager.get_term(command_name))
-    error = torch.sum(torch.square(command.joint_pos - command.robot_joint_pos), dim=-1)
+    asset: Entity = env.scene[asset_cfg.name]
+    error = torch.sum(torch.square(command.joint_pos - asset.data.joint_pos), dim=-1)
     return torch.exp(-error / std**2)
 
 
@@ -189,8 +191,8 @@ def deepmimic_pose_exp(
 ) -> torch.Tensor:
     """Pose reward: joint angle errors plus the root orientation error (angle), squared and summed."""
     command = cast(MotionCommand, env.command_manager.get_term(command_name))
-    # The actuated joints (motor side, ActuatedJointsMotionCommand.robot_joint_pos), as the motion's joint_pos.
-    joint_err = torch.sum(torch.square(command.joint_pos - command.robot_joint_pos), dim=-1)
+    asset: Entity = env.scene[asset_cfg.name]
+    joint_err = torch.sum(torch.square(command.joint_pos - asset.data.joint_pos), dim=-1)
     root_err = torch.square(quat_error_magnitude(command.anchor_quat_w, command.robot_anchor_quat_w))
     return torch.exp(-k * (joint_err + root_err))
 
@@ -200,7 +202,8 @@ def deepmimic_velocity_exp(
 ) -> torch.Tensor:
     """Velocity reward: joint velocity errors plus the root angular velocity error, squared and summed."""
     command = cast(MotionCommand, env.command_manager.get_term(command_name))
-    joint_err = torch.sum(torch.square(command.joint_vel - command.robot_joint_vel), dim=-1)
+    asset: Entity = env.scene[asset_cfg.name]
+    joint_err = torch.sum(torch.square(command.joint_vel - asset.data.joint_vel), dim=-1)
     root_err = torch.sum(torch.square(command.anchor_ang_vel_w - command.robot_anchor_ang_vel_w), dim=-1)
     return torch.exp(-k * (joint_err + root_err))
 
@@ -261,72 +264,40 @@ def hold_final_frame(motion, frames: int) -> None:
     motion.time_step_total = motion.joint_pos.shape[0]
 
 
-def actuated_joint_ids(asset: Entity) -> list[int]:
-    """Ids of the asset's actuated joints: all but the passive backlash joints (robot/backlash.py)."""
-    return [i for i, name in enumerate(asset.joint_names) if not is_backlash_joint(name)]
+@functools.cache
+def motion_joint_names() -> tuple[str, ...]:
+    """Joints of the motion files' joint_pos / joint_vel columns: every hinge of the climbing robot's MJCF, in order
+    (the motions are written with the full robot, head included, see scripts/*_to_npz.py)."""
+    from mjlab_microban.robot.microban_climb_constants import get_spec
+
+    return tuple(j.name for j in get_spec().joints if j.type == mujoco.mjtJoint.mjJNT_HINGE)
 
 
-class ActuatedJointsMotionCommand(MotionCommand):
-    """MotionCommand for a robot with backlash joints (robot/backlash.py): the motion's joint_pos / joint_vel are
-    those of the actuated joints only, so the robot's are read (``robot_joint_pos`` / ``robot_joint_vel``) and
-    written (reference state on resets, with the backlash joints at 0, at rest) on those joints. Without backlash
-    joints, the same as MotionCommand."""
+def select_motion_joints(motion, joint_names: list[str]) -> None:
+    """Keep the joint_pos / joint_vel columns of ``joint_names`` in a motion (MotionLoader-like, in place), whose
+    columns are motion_joint_names(); nothing to do when it already has exactly these joints."""
+    num = motion.joint_pos.shape[-1]
+    if num == len(joint_names):
+        return
+    names = motion_joint_names()
+    if num != len(names):
+        raise ValueError(f"motion with {num} joints: expected {len(joint_names)} or {len(names)} ({names})")
+    cols = torch.tensor([names.index(n) for n in joint_names], dtype=torch.long, device=motion.joint_pos.device)
+    motion.joint_pos = motion.joint_pos[:, cols].contiguous()
+    motion.joint_vel = motion.joint_vel[:, cols].contiguous()
+
+
+class RobotJointsMotionCommand(MotionCommand):
+    """MotionCommand whose motion is reduced to the robot's joints (select_motion_joints): the motion files have every
+    joint of the climbing robot's MJCF, the env's robot not its fixed ones (the head, see
+    microban_climbing_env_cfg.FIXED_JOINTS). Without fixed joints, the same as MotionCommand."""
 
     def __init__(self, cfg: MotionCommandCfg, env: ManagerBasedRlEnv):
         super().__init__(cfg, env)
-        ids = actuated_joint_ids(self.robot)
-        self.actuated_joint_ids = torch.tensor(ids, dtype=torch.long, device=self.device)
-        self.has_backlash = len(ids) < self.robot.num_joints
-        if self.motion.joint_pos.shape[-1] != len(ids):
-            raise ValueError(
-                f"motion {cfg.motion_file} has {self.motion.joint_pos.shape[-1]} joints, the robot {len(ids)} "
-                "actuated joints"
-            )
-
-    @property
-    def robot_joint_pos(self) -> torch.Tensor:
-        return self.robot.data.joint_pos[:, self.actuated_joint_ids]
-
-    @property
-    def robot_joint_vel(self) -> torch.Tensor:
-        return self.robot.data.joint_vel[:, self.actuated_joint_ids]
-
-    def _write_reference_state_to_sim(
-        self,
-        env_ids: torch.Tensor,
-        root_pos: torch.Tensor,
-        root_ori: torch.Tensor,
-        root_lin_vel: torch.Tensor,
-        root_ang_vel: torch.Tensor,
-        joint_pos: torch.Tensor,
-        joint_vel: torch.Tensor,
-    ) -> None:
-        if self.has_backlash:
-            full_pos = self.robot.data.default_joint_pos[env_ids].clone()  # backlash joints at 0
-            full_vel = torch.zeros_like(full_pos)
-            full_pos[:, self.actuated_joint_ids] = joint_pos
-            full_vel[:, self.actuated_joint_ids] = joint_vel
-            joint_pos, joint_vel = full_pos, full_vel
-        super()._write_reference_state_to_sim(
-            env_ids, root_pos, root_ori, root_lin_vel, root_ang_vel, joint_pos, joint_vel
-        )
-
-    def _debug_vis_impl(self, visualizer) -> None:
-        if not self.has_backlash or self.cfg.viz.mode != "ghost":
-            super()._debug_vis_impl(visualizer)
-            return
-        # The base class writes the motion's joint_pos at every joint's qpos address: give it the actuated ones'
-        # only (the ghost's backlash joints stay at 0) for the duration of the call.
-        indexing = self.robot.indexing
-        joint_q_adr = indexing.joint_q_adr
-        indexing.joint_q_adr = joint_q_adr[self.actuated_joint_ids]
-        try:
-            super()._debug_vis_impl(visualizer)
-        finally:
-            indexing.joint_q_adr = joint_q_adr
+        select_motion_joints(self.motion, list(self.robot.joint_names))
 
 
-class HoldEndMotionCommand(ActuatedJointsMotionCommand):
+class HoldEndMotionCommand(RobotJointsMotionCommand):
     """MotionCommand whose motion ends with ``end_hold_s`` [s] of its final configuration at rest."""
 
     cfg: HoldEndMotionCommandCfg
@@ -351,7 +322,14 @@ class HoldEndMotionCommand(ActuatedJointsMotionCommand):
         self._snap_time_steps(env_ids)
 
     def _adaptive_sampling(self, env_ids: torch.Tensor):
-        super()._adaptive_sampling(env_ids)
+        # Episodes that failed right after their spawn are not counted as failures of their bin.
+        terminated = self._env.termination_manager.terminated  # the buffer itself, read by the base class
+        saved = terminated[env_ids].clone()
+        terminated[env_ids] = saved & ~early_failures(self._env, env_ids)
+        try:
+            super()._adaptive_sampling(env_ids)
+        finally:
+            terminated[env_ids] = saved
         self._snap_time_steps(env_ids)
 
     def _snap_time_steps(self, env_ids: torch.Tensor) -> None:
@@ -360,6 +338,19 @@ class HoldEndMotionCommand(ActuatedJointsMotionCommand):
 
     def _write_reference_state_to_sim(self, env_ids, root_pos, *args, **kwargs) -> None:
         super()._write_reference_state_to_sim(env_ids, lift_spawn(root_pos, self.cfg.spawn_z_offset), *args, **kwargs)
+
+
+# Episodes that fail (a termination, not a time-out) within this many policy steps of their spawn are "early
+# failures": no learning signal (EarlyFailureMaskedPPO masks them) and ignored by the failure-driven samplers and
+# curricula (adaptive sampling, board_levels, board_horizons, adaptive_phase_level).
+EARLY_FAILURE_STEPS = 10
+
+
+def early_failures(env: ManagerBasedRlEnv, env_ids: torch.Tensor, max_steps: int = EARLY_FAILURE_STEPS) -> torch.Tensor:
+    """[len(env_ids)] bool: the episodes ending at this reset that failed within ``max_steps`` policy steps of their
+    start. Only valid during the reset (before the termination buffers and episode lengths are cleared)."""
+    steps = env.episode_length_buf[env_ids]
+    return env.termination_manager.terminated[env_ids] & (steps > 0) & (steps <= max_steps)
 
 
 def lift_spawn(root_pos: torch.Tensor, dz: float) -> torch.Tensor:
@@ -1374,6 +1365,14 @@ class robot_stuck:
         max_time: float = 2.0,
         asset_name: str = "robot",
     ) -> torch.Tensor:
+        self._advance(env, command_name, distance, asset_name)
+        stuck = (self.stuck_time > max_time).float()
+        env.extras["log"]["Metrics/robot_stuck_frac"] = stuck.mean()
+        env.extras["log"]["Metrics/robot_stuck_time_mean"] = self.stuck_time.mean()
+        return stuck
+
+    def _advance(self, env: ManagerBasedRlEnv, command_name: str, distance: float, asset_name: str) -> None:
+        """One env step of the stuck clock."""
         asset: Entity = env.scene[asset_name]
         points = torch.cat([asset.data.root_link_pos_w[:, None], asset.data.site_pos_w[:, self.site_ids]], dim=1)
         moved = (points - self.anchor).norm(dim=-1).amax(dim=-1) > distance
@@ -1384,9 +1383,32 @@ class robot_stuck:
         self.needs_anchor[:] = False
         self.stuck_time = torch.where(restart, torch.zeros_like(self.stuck_time), self.stuck_time + self.step_dt)
 
-        stuck = (self.stuck_time > max_time).float()
-        env.extras["log"]["Metrics/robot_stuck_frac"] = stuck.mean()
-        env.extras["log"]["Metrics/robot_stuck_time_mean"] = self.stuck_time.mean()
+
+class robot_stuck_terminated(robot_stuck):
+    """Termination: True once the robot has been stuck (as robot_stuck, with its own clock: the reward term's is not
+    advanced while its weight is 0) for longer than ``max_time`` [s].
+
+    With ``reward_term`` set, only once that reward term's weight (e.g. ramped by reward_weight_ramp) has reached
+    ``min_weight_fraction`` of ``full_weight``; before that, never."""
+
+    def __call__(
+        self,
+        env: ManagerBasedRlEnv,
+        command_name: str,
+        site_names: tuple[str, ...],
+        distance: float = 0.03,
+        max_time: float = 2.0,
+        asset_name: str = "robot",
+        reward_term: str | None = None,
+        full_weight: float = 1.0,
+        min_weight_fraction: float = 0.5,
+    ) -> torch.Tensor:
+        self._advance(env, command_name, distance, asset_name)
+        stuck = self.stuck_time > max_time
+        if reward_term is not None:
+            weight = env.reward_manager.get_term_cfg(reward_term).weight
+            if weight / full_weight < min_weight_fraction:
+                return torch.zeros_like(stuck)
         return stuck
 
 
@@ -1418,8 +1440,7 @@ def motion_future_joint_pos(
     else:
         future = torch.tensor(offsets, dtype=torch.long, device=env.device)  # [K]
     idx = motion_frames_ahead(command, future)  # [B, K]
-    default = asset.data.default_joint_pos[:, actuated_joint_ids(asset)]  # the motion's joints: the actuated ones
-    joint_pos = motion.joint_pos[idx] - default[:, None]  # [B, K, J]
+    joint_pos = motion.joint_pos[idx] - asset.data.default_joint_pos[:, None]  # [B, K, J]
     return joint_pos.reshape(joint_pos.shape[0], -1)
 
 
@@ -1596,3 +1617,107 @@ def base_yaw_rel_board_exceeded(
     """Termination: the trunk is rotated about the board's z axis by more than max_yaw (rad) relative to the
     board (0 = facing the board as in the start pose)."""
     return _base_yaw_rel_board(env, board_name, asset_cfg).abs() > max_yaw
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Shared extra observation delay
+# ---------------------------------------------------------------------------------------------------------------------
+
+
+class shared_extra_delay:
+    """Observation term: another term (``func`` with ``params``) delayed by an extra lag that every term using this
+    wrapper shares within an env, on top of the term's own mjlab delay (ObservationTermCfg.delay_*_lag, applied
+    after this, so the lags add up).
+
+    The extra lag [policy steps] is drawn per env from ``lags`` on reset; at every step it is kept with
+    ``hold_prob``, otherwise drawn again, so it changes now and then mid-episode. One lag per env for all the
+    wrapped terms (stored on the env): a late sensor packet delays all of the measurements together.
+    Right after a reset, the buffer holds the first observation (no older frames yet).
+    """
+
+    def __init__(self, cfg, env: ManagerBasedRlEnv):
+        self._env_ref = env
+        params = cfg.params
+        for value in params["params"].values():
+            if isinstance(value, SceneEntityCfg):
+                value.resolve(env.scene)
+        self._lags = torch.as_tensor(params["lags"], dtype=torch.long, device=env.device)
+        self._len = int(self._lags.max()) + 1
+        self._buf: torch.Tensor | None = None  # [len, E, ...]
+        self._head = 0
+        self._step = -1
+        self._fill = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+        self._shared(env)
+
+    def _shared(self, env: ManagerBasedRlEnv) -> dict:
+        state = getattr(env, "_shared_obs_extra_delay", None)
+        if state is None:
+            n = len(self._lags)
+            lag = self._lags[torch.randint(n, (env.num_envs,), device=env.device)]
+            state = {"lags": self._lags, "lag": lag, "step": env.common_step_counter}
+            env._shared_obs_extra_delay = state
+        elif not torch.equal(state["lags"], self._lags):
+            raise ValueError(f"shared_extra_delay: lags {self._lags.tolist()} != {state['lags'].tolist()} of "
+                             f"another term (one shared lag per env)")
+        return state
+
+    def _draw(self, state: dict, ids: torch.Tensor) -> None:
+        state["lag"][ids] = self._lags[torch.randint(len(self._lags), (len(ids),), device=ids.device)]
+
+    def reset(self, env_ids: torch.Tensor | slice | None = None) -> None:
+        if env_ids is None or isinstance(env_ids, slice):
+            env_ids = torch.arange(len(self._fill), device=self._fill.device)
+        self._fill[env_ids] = True
+        self._draw(self._shared(self._env_ref), env_ids)
+
+    def __call__(
+        self,
+        env: ManagerBasedRlEnv,
+        func,
+        params: dict,
+        lags: tuple[int, ...],
+        hold_prob: float,
+    ) -> torch.Tensor:
+        del lags
+        obs = func(env, **params)
+        state = self._shared(env)
+        step = env.common_step_counter
+        if state["step"] != step:  # once per step, by whichever term comes first
+            state["step"] = step
+            redraw = torch.rand(env.num_envs, device=env.device) >= hold_prob
+            self._draw(state, redraw.nonzero(as_tuple=False).squeeze(-1))
+        if self._buf is None:
+            self._buf = obs.unsqueeze(0).repeat(self._len, *([1] * obs.dim())).clone()
+        if step != self._step:  # a new step: a new slot (the same step again, e.g. after a reset: overwritten)
+            self._step = step
+            self._head = (self._head + 1) % self._len
+        self._buf[self._head] = obs
+        if self._fill.any():
+            self._buf[:, self._fill] = obs[self._fill]
+            self._fill[:] = False
+        slot = (self._head - state["lag"]) % self._len  # [E]
+        return self._buf[slot, torch.arange(env.num_envs, device=env.device)]
+
+
+def with_shared_extra_delay(term, lags: tuple[int, ...], hold_prob: float):
+    """``term`` (an ObservationTermCfg) wrapped by shared_extra_delay; its own noise / delay / history are kept."""
+    return replace(
+        term,
+        func=shared_extra_delay,
+        params={"func": term.func, "params": dict(term.params), "lags": tuple(lags), "hold_prob": hold_prob},
+    )
+
+
+def strip_observation_delays(cfg) -> None:
+    """No observation delay in ``cfg``'s groups (shared_extra_delay unwrapped, mjlab delays zeroed): for the deploy
+    export's parity check, whose robot-side controller reads the measurements as they come (the real robot is late
+    by itself)."""
+    for group in cfg.observations.values():
+        if group is None:
+            continue
+        for name, term in group.terms.items():
+            if term is None:
+                continue
+            if term.func is shared_extra_delay:
+                term = replace(term, func=term.params["func"], params=term.params["params"])
+            group.terms[name] = replace(term, delay_min_lag=0, delay_max_lag=0)

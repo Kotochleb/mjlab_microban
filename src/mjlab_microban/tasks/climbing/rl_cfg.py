@@ -12,12 +12,24 @@ Experiment names keep a ``_residual`` suffix, so the log directories stay apart 
 runs (logs/rsl_rl/mjlab_microban_climbing)."""
 
 from copy import deepcopy
+from dataclasses import dataclass
 
 from mjlab.rl import (
     RslRlModelCfg,
     RslRlOnPolicyRunnerCfg,
     RslRlPpoAlgorithmCfg,
 )
+
+from mjlab_microban.tasks.climbing.mdp import EARLY_FAILURE_STEPS
+
+
+@dataclass
+class EarlyFailureMaskedPpoCfg(RslRlPpoAlgorithmCfg):
+    """PPO without a learning signal from the episodes that fail within ``early_failure_steps`` policy steps of
+    their spawn (masked_ppo.py)."""
+
+    early_failure_steps: int = EARLY_FAILURE_STEPS
+    class_name: str = "mjlab_microban.tasks.climbing.masked_ppo:EarlyFailureMaskedPPO"
 
 
 MicrobanClimbingRlCfg = RslRlOnPolicyRunnerCfg(
@@ -38,7 +50,7 @@ MicrobanClimbingRlCfg = RslRlOnPolicyRunnerCfg(
         activation="elu",
         obs_normalization=True,
     ),
-    algorithm=RslRlPpoAlgorithmCfg(
+    algorithm=EarlyFailureMaskedPpoCfg(
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,

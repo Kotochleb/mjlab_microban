@@ -97,6 +97,21 @@ ACTOR_FUTURE_OFFSETS = _staged_offsets(FUTURE_WINDOW_STEPS, FUTURE_STAGE_GAPS, F
 # Policy steps of history of the actor's proprioceptive terms (the current one and the 4 before it, 0.1 s).
 ACTOR_HISTORY_STEPS = 5
 
+# Sensing delay of the actor's sensor terms, in policy steps (20 ms each).
+# - Per-term base delay, as in the velocity task (mjlab's delay buffer, lag drawn per env; the IMU terms redraw it
+#   every 64 steps): (min_lag, max_lag, update_period).
+SENSOR_BASE_DELAYS = {
+    "base_ang_vel": (0, 3, 64),
+    "projected_gravity": (0, 3, 64),
+    "joint_pos": (0, 0, 0),
+    "joint_vel": (0, 1, 0),
+}
+# - Extra delay on top, the same for all four terms of an env (mdp.shared_extra_delay): +1 or +2 steps, drawn on
+#   reset and kept at every step with SENSOR_EXTRA_DELAY_HOLD_PROB (redrawn every ~1 s on average, so it changes
+#   every ~2 s). The actions and the command are not delayed (the policy's own outputs / the reference).
+SENSOR_EXTRA_DELAY_LAGS = (1, 2)
+SENSOR_EXTRA_DELAY_HOLD_PROB = 0.98
+
 # Future frames (policy steps ahead) of the critic's motion window and contact schedule: three stages,
 # sparser further ahead (every step, every 2nd, every 4th), 0.36 s in total.
 CRITIC_FUTURE_OFFSETS = (1, 2, 3, 4, 6, 8, 10, 14, 18)
@@ -141,12 +156,20 @@ START_JOINT_POS = {
 # and mujoco_warp checks its constraint rows against njmax: it is kept out of the wall's reach (x < 0.2 m).
 QPOS0_TRUNK_X = -0.25
 # [m] the robot's spawn height above its reference on every reset (see HoldEndMotionCommandCfg.spawn_z_offset).
-SPAWN_Z_OFFSET = 0.002
+SPAWN_Z_OFFSET = 0.003
 
 
-def _robot_spec_fn(get_spec, trunk_pos):
+# Joints removed from the robot: their bodies are fixed to their parents at the joint's 0 (not actuated). The head
+# stays straight: it is not used for climbing. The motions keep them (the motion command drops their columns, see
+# mdp.select_motion_joints).
+FIXED_JOINTS = ("head",)
+
+
+def _robot_spec_fn(get_spec, trunk_pos, fixed_joints: tuple[str, ...]):
     def spec_fn():
         spec = get_spec()
+        for name in fixed_joints:  # the body welded to its parent at the joint's 0
+            spec.delete(spec.joint(name))
         spec.body("trunk").pos = trunk_pos
         spec.body("trunk").quat = (1.0, 0.0, 0.0, 0.0)
         # Collision groups (wall.py, COLLISION_WORLD): every robot collision geom is in the world group, the
@@ -171,9 +194,12 @@ TRACKED_BODY_NAMES = ("trunk",) + END_EFFECTOR_BODY_NAMES + ("head",)
 # Contact slots per ball / capsule of the grip_hold_contact sensor (its strongest contacts with the wall).
 GRIP_HOLD_CONTACT_SLOTS = 3
 # robot_stuck penalty: stuck when the trunk and the four balls all stay within STUCK_DISTANCE [m] of where they
-# last were for longer than STUCK_MAX_TIME [s].
+# last were for longer than STUCK_MAX_TIME [s]; the episode is terminated once stuck for longer than
+# STUCK_TERMINATE_TIME [s].
 STUCK_DISTANCE = 0.03
-STUCK_MAX_TIME = 2.0
+STUCK_MAX_TIME = 1.0
+STUCK_TERMINATE_TIME = 2.0
+STUCK_WEIGHT = -3.0  # the full weight of the robot_stuck penalty
 # Contact slots per ball of the ball_hold_contact sensor (a seated ball touches the floor and up to two walls).
 BALL_HOLD_CONTACT_SLOTS = 3
 # Policy steps before and after the current one on which the reference has to expect a ball on a hold for
@@ -185,11 +211,14 @@ def make_microban_climbing_env_cfg(
     play: bool = False,
     wall: WallSpec | None = None,
     motion_file: str | None = None,
+    fixed_head: bool = True,
 ) -> ManagerBasedRlEnvCfg:
     """wall: the climbing_sim route (default: the ``wall`` of the motion on the train / play command line, see
     wall.wall_spec_from_argv). It has to be the wall the motion was planned on.
     motion_file: the motion whose ``used_holds`` get the 5-box collision cups (the other holds 1-box blocks);
-    None: the train / play command line's --env.commands.motion.motion-file (see wall.make_wall_cfg)."""
+    None: the train / play command line's --env.commands.motion.motion-file (see wall.make_wall_cfg).
+    fixed_head: remove the head joint (FIXED_JOINTS): the head is fixed straight on the trunk, not actuated. The
+    motion converters (scripts/*_to_npz.py) turn it off, to write the motions with every joint of the robot."""
     wall = wall_spec_from_argv() if wall is None else wall
     holds = tuple(tuple(float(v) for v in p) for p in hold_positions(wall))
     cfg = make_tracking_env_cfg()
@@ -216,7 +245,11 @@ def make_microban_climbing_env_cfg(
         rot=(1.0, 0.0, 0.0, 0.0),
         joint_pos=dict(START_JOINT_POS),
     )
-    robot_cfg.spec_fn = _robot_spec_fn(robot_cfg.spec_fn, (QPOS0_TRUNK_X, *robot_cfg.init_state.pos[1:]))
+    robot_cfg.spec_fn = _robot_spec_fn(
+        robot_cfg.spec_fn,
+        (QPOS0_TRUNK_X, *robot_cfg.init_state.pos[1:]),
+        FIXED_JOINTS if fixed_head else (),
+    )
     cfg.scene.entities = {
         "robot": robot_cfg,
         "wall": make_wall_cfg(wall, motion_file),
@@ -334,6 +367,19 @@ def make_microban_climbing_env_cfg(
     for name, term in cfg.observations["actor"].terms.items():
         if name != "command":
             cfg.observations["actor"].terms[name] = replace(term, history_length=ACTOR_HISTORY_STEPS)
+    # Sensing delay: the shared extra delay (applied first, on the raw values), then the per-term base delay; both
+    # before the history, so the stacked frames are the delayed ones. Training and play; the deploy export strips
+    # them (mdp.strip_observation_delays).
+    for name, (min_lag, max_lag, period) in SENSOR_BASE_DELAYS.items():
+        term = replace(
+            cfg.observations["actor"].terms[name],
+            delay_min_lag=min_lag,
+            delay_max_lag=max_lag,
+            delay_update_period=period,
+        )
+        cfg.observations["actor"].terms[name] = mdp.with_shared_extra_delay(
+            term, SENSOR_EXTRA_DELAY_LAGS, SENSOR_EXTRA_DELAY_HOLD_PROB
+        )
 
     # Privileged critic observations: world placement (position relative to the env origin, and
     # orientation) of the robot's trunk and of the reference trunk. The wall is fixed in the env frame,
@@ -434,7 +480,7 @@ def make_microban_climbing_env_cfg(
         # Exponential barrier past 95 % of the available motor torque (BAM: velocity and battery dependent).
         "torque_barrier": RewardTermCfg(
             func=mdp.motor_torque_exp_barrier,
-            weight=-0.05,
+            weight=-0.1,
             params={"threshold": TORQUE_BARRIER_THRESHOLD, "sharpness": TORQUE_BARRIER_SHARPNESS},
         ),
         # Penalty while the robot has not moved (trunk and balls all within STUCK_DISTANCE of where they last were)
@@ -442,7 +488,7 @@ def make_microban_climbing_env_cfg(
         # (robot_stuck_weight) in training.
         "robot_stuck": RewardTermCfg(
             func=mdp.robot_stuck,
-            weight=-1.0,
+            weight=STUCK_WEIGHT,
             params={
                 "command_name": "motion",
                 "site_names": BALL_SITE_NAMES,
@@ -506,17 +552,10 @@ def make_microban_climbing_env_cfg(
     )
 
     # The balls and capsules are what touches the holds: randomise their friction (the feet's in the tracking
-    # task), sliding coefficient U(0.01, 0.5), shared by all of them in an env. They have priority 1, so this is
+    # task), sliding coefficient U(0.08, 0.5), shared by all of them in an env. They have priority 1, so this is
     # the friction of their contacts with the holds (and with the board / floor), not the holds' HOLD_FRICTION.
     cfg.events["foot_friction"].params["asset_cfg"].geom_names = GRIP_GEOM_NAMES
-    cfg.events["foot_friction"].params["ranges"] = (0.01, 0.5)
-
-    cfg.events["base_com"].params["asset_cfg"].body_names = ("trunk",)
-    cfg.events["base_com"].params["ranges"] = {
-        0: (-0.005, 0.005),
-        1: (-0.005, 0.005),
-        2: (-0.005, 0.005),
-    }
+    cfg.events["foot_friction"].params["ranges"] = (0.08, 0.5)
 
     cfg.events["dof_armature_randomization"] = EventTermCfg(
         mode="startup",
@@ -529,7 +568,7 @@ def make_microban_climbing_env_cfg(
     )
     # Link mass and inertia, per env and body, physically consistent (pseudo-inertia parameterisation): alpha
     # scales mass and inertia by e^(2 alpha) (+-5 % here), d stretches the inertia ellipsoid per axis (inertia
-    # tensor shape, mass unchanged). The COM is left to base_com above.
+    # tensor shape, mass unchanged). The COM is left to base_com below.
     cfg.events["link_inertia"] = EventTermCfg(
         mode="startup",
         func=dr.pseudo_inertia,
@@ -540,8 +579,18 @@ def make_microban_climbing_env_cfg(
         },
     )
 
+    # Trunk COM offset, +-5 mm per axis. Re-registered after link_inertia: startup events run in insertion order and
+    # pseudo_inertia rewrites body_ipos from the default model, which would otherwise erase this offset.
+    cfg.events["base_com"] = cfg.events.pop("base_com")
+    cfg.events["base_com"].params["asset_cfg"].body_names = ("trunk",)
+    cfg.events["base_com"].params["ranges"] = {
+        0: (-0.005, 0.005),
+        1: (-0.005, 0.005),
+        2: (-0.005, 0.005),
+    }
+
     # Very small random pushes on the trunk (the robot weighs ~0.81 kg, ~8 N): a constant wrench of up to
-    # 0.2 N / 0.01 N.m per axis, held 0.05-0.2 s, every 1-3 s, per env.
+    # 0.2 N / 0.01 N.m per axis, held 0.05-0.2 s, every 1-2 s, per env.
     cfg.events["base_perturbation"] = EventTermCfg(
         mode="step",
         func=envs_mdp.apply_body_impulse,
@@ -550,7 +599,7 @@ def make_microban_climbing_env_cfg(
             "force_range": (-0.2, 0.2),
             "torque_range": (-0.01, 0.01),
             "duration_s": (0.05, 0.2),
-            "cooldown_s": (1.0, 3.0),
+            "cooldown_s": (1.0, 2.0),
         },
     )
 
@@ -577,7 +626,7 @@ def make_microban_climbing_env_cfg(
     # vin_range / max_current) over 500 training iterations of 24 env steps each.
     if not play:
         # Actuator DR: joint friction +-10 % and battery voltage 7-9 V (8 V +-12.5 %), per env. Both ranges
-        # start at +-1 %, held until iteration 500, then widen linearly to the full ones at iteration 1000.
+        # start at +-1 %, held until iteration 200, then widen linearly to the full ones at iteration 600.
         # Listed before bam_power, which interpolates its boosted voltage to these.
         cfg.curriculum["actuator_dr"] = CurriculumTermCfg(
             func=mdp.actuator_dr_curriculum,
@@ -586,11 +635,12 @@ def make_microban_climbing_env_cfg(
                 "vin_rel_range": 0.125,
                 "friction_rel_range": 0.10,
                 "rel_start": 0.01,
-                "hold_steps": 500 * 24,
-                "full_steps": 1000 * 24,
+                "hold_steps": 200 * 24,
+                "full_steps": 600 * 24,
             },
         )
-        # Ball sphere (collision geom) positions: +-1 mm in x, y and z, per env and ball, same schedule.
+        # Ball sphere (collision geom) positions: +-1 mm in x, y and z, per env and ball. Start at +-1 %, held until
+        # iteration 500, then widen linearly to the full range at iteration 1000.
         cfg.curriculum["ball_pos_dr"] = CurriculumTermCfg(
             func=mdp.geom_pos_dr_curriculum,
             params={
@@ -601,15 +651,15 @@ def make_microban_climbing_env_cfg(
                 "full_steps": 1000 * 24,
             },
         )
-        # Ball sphere radius: 1.5 mm undersized (12.5 -> 11 mm) up to iteration 300, then grown linearly to the
-        # nominal radius at iteration 800.
+        # Ball sphere radius: 1.5 mm undersized (12.5 -> 11 mm) up to iteration 100, then grown linearly to the
+        # nominal radius at iteration 500.
         cfg.curriculum["ball_radius"] = CurriculumTermCfg(
             func=mdp.sphere_radius_curriculum,
             params={
                 "asset_cfg": SceneEntityCfg("robot", geom_names=BALL_GEOM_NAMES),
                 "undersize": 0.0015,
-                "hold_steps": 300 * 24,
-                "full_steps": 800 * 24,
+                "hold_steps": 100 * 24,
+                "full_steps": 500 * 24,
             },
         )
         # Reference motion speed, per env and episode: U(0.95, 1.05) up to iteration 500, then the bounds widen
@@ -651,6 +701,21 @@ def make_microban_climbing_env_cfg(
     cfg.terminations["base_yaw_rel_board"] = TerminationTermCfg(
         func=mdp.base_yaw_rel_board_exceeded,
         params={"max_yaw": math.radians(60.0), "board_name": "wall"},
+    )
+
+    # Stuck (see the robot_stuck penalty) for longer than STUCK_TERMINATE_TIME: the episode fails, once the penalty's
+    # weight has been ramped up (robot_stuck_weight curriculum) to at least half of STUCK_WEIGHT.
+    cfg.terminations["robot_stuck"] = TerminationTermCfg(
+        func=mdp.robot_stuck_terminated,
+        params={
+            "command_name": "motion",
+            "site_names": BALL_SITE_NAMES,
+            "distance": STUCK_DISTANCE,
+            "max_time": STUCK_TERMINATE_TIME,
+            "reward_term": "robot_stuck",
+            "full_weight": STUCK_WEIGHT,
+            "min_weight_fraction": 0.5,
+        },
     )
 
     #---------------------------- Viewer ----------------------------

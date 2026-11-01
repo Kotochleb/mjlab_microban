@@ -53,6 +53,7 @@ from mjlab_microban.tasks.climbing.mdp import (
     _ball_site_offsets,
     _motion_first_frame as motion_first_frame,
     _motion_last_frame,
+    early_failures,
 )
 
 if TYPE_CHECKING:
@@ -349,7 +350,8 @@ class adaptive_phase_level:
         del reward_terms, init_level
         command = adaptive_phase_command(env, command_name)
         if not isinstance(env_ids, slice):
-            ran = env.episode_length_buf[env_ids] > 0  # not the env's first reset
+            # Not the env's first reset, nor an episode that failed right after its spawn.
+            ran = (env.episode_length_buf[env_ids] > 0) & ~early_failures(env, env_ids)
             if torch.any(ran):
                 progress = command.phase_progress()[env_ids][ran]
                 self._sum += float(progress.clamp(-1.0, 2.0).sum())
