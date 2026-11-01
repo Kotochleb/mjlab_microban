@@ -46,8 +46,8 @@
 #                           gait, 2 s still after each move); --multi-board for the board file instead, or set
 #                           TASK=...-Finetune. Without --play: training resumes from
 #                           the last checkpoint of --finetune-from (default: $FINETUNE_FROM, or
-#                           kotochleb-cnrs-laas/mjlab_microban_climbing/cp4zxscz, trained on
-#                           Mjlab-Climbing-Microban-Adaptive-Phase-Multi-Board). With --play: play a fine-tuned run
+#                           kotochleb-cnrs-laas/mjlab_microban_climbing/al2qgf37, itself a fine-tune of cp4zxscz on
+#                           Mjlab-Climbing-Microban-Adaptive-Phase-Multi-Board-Finetune). With --play: play a fine-tuned run
 #                           (--wandb-run-path / --run / --checkpoint) in the fine-tuning env
 #   --finetune-from R       the W&B run to fine-tune (implies --finetune): entity/project/run_id
 #   --finetune-checkpoint NAME     its checkpoint to start from, e.g. model_7000.pt (implies --finetune; default:
@@ -166,7 +166,7 @@ ROBOT_VIEW=false
 ROBOT_SECONDS=60
 OFFLINE=false
 FINETUNE=false
-FINETUNE_FROM="${FINETUNE_FROM:-kotochleb-cnrs-laas/mjlab_microban_climbing/cp4zxscz}"
+FINETUNE_FROM="${FINETUNE_FROM:-kotochleb-cnrs-laas/mjlab_microban_climbing/al2qgf37}"
 FINETUNE_CHECKPOINT=""
 
 need_value() { [[ $2 -ge 2 ]] || { echo "$1 needs a value" >&2; exit 1; }; }
