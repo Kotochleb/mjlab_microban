@@ -28,7 +28,9 @@ MESH_COLOR = (217, 89, 38)  # wall_hold material
 HULL_COLOR = (64, 140, 242)
 SPHERE_COLOR = (255, 128, 0)
 BALL_COLOR = (26, 217, 217)
-APPROX_COLORS = {"three_box": (60, 200, 90), "five_box": (240, 200, 40), "one_box": (180, 80, 220)}
+APPROX_COLORS = {
+    "three_box": (60, 200, 90), "five_box": (240, 200, 40), "five_box_legacy": (240, 110, 40), "one_box": (180, 80, 220),
+}
 
 
 def parse_args() -> argparse.Namespace:

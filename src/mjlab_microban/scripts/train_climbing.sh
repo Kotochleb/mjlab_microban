@@ -15,6 +15,7 @@
 #   src/mjlab_microban/scripts/train_climbing.sh --play [variant flags] [play flags] [motion.npz] [extra play args...]
 #   src/mjlab_microban/scripts/train_climbing.sh --replay [variant flags] [motion.npz] [extra play args...]
 #   src/mjlab_microban/scripts/train_climbing.sh --deploy [variant flags] [play flags] [deploy flags] [motion.npz]
+#   src/mjlab_microban/scripts/train_climbing.sh --finetune [fine-tune flags] [extra train args...]
 #
 # All climbing tasks use residual actions (target = ref + 0.25 * effort_limit / kp * a) and no state estimation.
 #
@@ -33,6 +34,21 @@
 #                           motions come from a board file, not from a motion file argument
 #   --boards-file F         the board file of --multi-board (default: tasks/climbing/boards/multi_board.json);
 #                           make its motions first with src/mjlab_microban/scripts/make_multi_board_motions.py
+# Fine-tune flags (resume a trained policy and keep training it; tasks/climbing/microban_climbing_finetune_env_cfg.py):
+#   --finetune              train the -Finetune variant of the task: the used holds collide as the legacy 5-box cup
+#                           (five upright boxes, no trims / tilts / posts, before git 20a0573), every curriculum
+#                           starts at its final value (full DR ranges, realistic motor power, adaptive phase level 1,
+#                           all board levels, maximum board horizons), and the firmware P gain is drawn per env and
+#                           joint in 120 * [0.9, 1.1]. Implies --adaptive-phase and --multi-board (the task of the
+#                           default run; set TASK=...-Finetune for another one). Without --play: training resumes from
+#                           the last checkpoint of --finetune-from (default: $FINETUNE_FROM, or
+#                           kotochleb-cnrs-laas/mjlab_microban_climbing/cp4zxscz, trained on
+#                           Mjlab-Climbing-Microban-Adaptive-Phase-Multi-Board). With --play: play a fine-tuned run
+#                           (--wandb-run-path / --run / --checkpoint) in the fine-tuning env
+#   --finetune-from R       the W&B run to fine-tune (implies --finetune): entity/project/run_id
+#   --finetune-checkpoint NAME     its checkpoint to start from, e.g. model_7000.pt (implies --finetune; default:
+#                           its latest)
+#   The run's networks have to fit the task: give the same variant flags (--policy) as the run was trained with.
 # Run flags:
 #   --num-envs N            number of parallel environments (default: 4096, or $NUM_ENVS)
 #   --no-video              do not record training videos
@@ -106,6 +122,8 @@
 #   src/mjlab_microban/scripts/train_climbing.sh --conv1d --num-envs 2048 --no-video
 #   src/mjlab_microban/scripts/train_climbing.sh --multi-board --conv1d-history
 #   src/mjlab_microban/scripts/train_climbing.sh --play --conv1d-history
+#   src/mjlab_microban/scripts/train_climbing.sh --finetune --agent.max-iterations 5000
+#   src/mjlab_microban/scripts/train_climbing.sh --finetune-checkpoint model_7000.pt
 #   src/mjlab_microban/scripts/train_climbing.sh --replay src/mjlab_microban/motion/multi_board/l2s19.npz
 #   src/mjlab_microban/scripts/train_climbing.sh --play --conv1d --wandb-run-path my-team/mjlab_microban_climbing/abc123xy
 #   src/mjlab_microban/scripts/train_climbing.sh --play --viser --adaptive-phase --wandb-run-path my-team/mjlab_microban_climbing/abc123xy
@@ -143,6 +161,9 @@ ROBOT_HOST=""
 ROBOT_VIEW=false
 ROBOT_SECONDS=60
 OFFLINE=false
+FINETUNE=false
+FINETUNE_FROM="${FINETUNE_FROM:-kotochleb-cnrs-laas/mjlab_microban_climbing/cp4zxscz}"
+FINETUNE_CHECKPOINT=""
 
 need_value() { [[ $2 -ge 2 ]] || { echo "$1 needs a value" >&2; exit 1; }; }
 
@@ -187,6 +208,11 @@ while [[ $# -gt 0 ]]; do
     --seconds) need_value "$1" $#; ROBOT_SECONDS="$2"; shift 2 ;;
     --seconds=*) ROBOT_SECONDS="${1#*=}"; shift ;;
     --offline) OFFLINE=true; shift ;;
+    --finetune) FINETUNE=true; shift ;;
+    --finetune-from) need_value "$1" $#; FINETUNE=true; FINETUNE_FROM="$2"; shift 2 ;;
+    --finetune-from=*) FINETUNE=true; FINETUNE_FROM="${1#*=}"; shift ;;
+    --finetune-checkpoint) need_value "$1" $#; FINETUNE=true; FINETUNE_CHECKPOINT="$2"; shift 2 ;;
+    --finetune-checkpoint=*) FINETUNE=true; FINETUNE_CHECKPOINT="${1#*=}"; shift ;;
     --host) need_value "$1" $#; DEPLOY=true; PLAY=true; ROBOT_HOST="$2"; shift 2 ;;
     --host=*) DEPLOY=true; PLAY=true; ROBOT_HOST="${1#*=}"; shift ;;
     *) ARGS+=("$1"); shift ;;
@@ -195,6 +221,16 @@ done
 set -- ${ARGS[@]+"${ARGS[@]}"}
 
 $PLAY && ! $NUM_ENVS_SET && NUM_ENVS=1
+if $FINETUNE; then
+  $DEPLOY && { echo "--finetune is a training env: drop --deploy (deploy the fine-tuned run without it)" >&2; exit 1; }
+  if [[ -n "${TASK:-}" ]]; then
+    [[ "$TASK" == *-Finetune ]] || { echo "--finetune needs a -Finetune task, got TASK=$TASK" >&2; exit 1; }
+    [[ "$TASK" == *-Multi-Board* ]] && MULTI_BOARD=true
+  else
+    ADAPTIVE_PHASE=true
+    MULTI_BOARD=true
+  fi
+fi
 if $DEPLOY; then
   $REPLAY && { echo "--deploy exports a policy: drop --replay" >&2; exit 1; }
   $MULTI_BOARD && { echo "--deploy takes one board: drop --multi-board (give the board's motion file)" >&2; exit 1; }
@@ -223,6 +259,7 @@ else
   else
     TASK="$TASK_PREFIX$POLICY_SUFFIX"
   fi
+  $FINETUNE && TASK+="-Finetune"
 fi
 
 # Run from the repository root so logs end up in logs/rsl_rl/.
@@ -234,8 +271,12 @@ REPO_ROOT="$(cd "$(dirname "$(realpath "$0")")/../../.." && pwd)"
 
 # The rsl_rl experiment (logs/rsl_rl/<name>) of a task id, as in tasks/climbing/rl_cfg.py and __init__.py.
 experiment_name() {
-  local rest="${1#Mjlab-Climbing-Microban}" name="mjlab_microban_climbing_residual" multi="" adaptive=""
+  local rest="${1#Mjlab-Climbing-Microban}" name="mjlab_microban_climbing_residual" multi="" adaptive="" finetune=""
   [[ "$rest" != "$1" ]] || return 1
+  if [[ "$rest" == *-Finetune ]]; then
+    finetune="_finetune"
+    rest="${rest%-Finetune}"
+  fi
   if [[ "$rest" == -Adaptive-Phase* ]]; then
     adaptive="_adaptive_phase"
     rest="${rest#-Adaptive-Phase}"
@@ -250,7 +291,7 @@ experiment_name() {
     -Conv1d-History) name+="_conv1d_history" ;;
     *) return 1 ;;
   esac
-  echo "$name$adaptive$multi"
+  echo "$name$adaptive$multi$finetune"
 }
 
 # The latest model_<iteration>.pt of a run directory (by iteration), or nothing.
@@ -500,13 +541,21 @@ fi
 
 export MUJOCO_GL=egl
 
+# Fine-tuning: resume the run's checkpoint (downloaded from W&B), under a run name after it.
+RESUME_ARGS=()
+if $FINETUNE; then
+  RESUME_ARGS=(--agent.resume True --wandb-run-path "$FINETUNE_FROM" --agent.run-name "finetune-${FINETUNE_FROM##*/}")
+  [[ -n "$FINETUNE_CHECKPOINT" ]] && RESUME_ARGS+=(--wandb-checkpoint-name "$FINETUNE_CHECKPOINT")
+  echo "[INFO] Fine-tuning W&B run $FINETUNE_FROM (${FINETUNE_CHECKPOINT:-latest checkpoint})"
+fi
+
 if $MULTI_BOARD; then
   if [[ $# -ge 1 && "$1" != -* ]]; then
     echo "--multi-board takes its motions from the board file, not $1 (use --boards-file)" >&2
     exit 1
   fi
   cd "$REPO_ROOT"
-  CMD=(uv run train "$TASK" --env.scene.num-envs "$NUM_ENVS" --video "$VIDEO" "$@")
+  CMD=(uv run train "$TASK" --env.scene.num-envs "$NUM_ENVS" --video "$VIDEO" ${RESUME_ARGS[@]+"${RESUME_ARGS[@]}"} "$@")
   echo "[INFO] Training $TASK with $NUM_ENVS envs on the boards of ${MICROBAN_BOARDS_FILE:-src/mjlab_microban/tasks/climbing/boards/multi_board.json}"
   if $DRY_RUN; then
     printf '%q ' "${CMD[@]}"; echo
@@ -574,6 +623,7 @@ CMD=(uv run train "$TASK"
   --env.scene.num-envs "$NUM_ENVS"
   --env.commands.motion.motion-file "$MOTION_FILE"
   --video "$VIDEO"
+  ${RESUME_ARGS[@]+"${RESUME_ARGS[@]}"}
   "$@")
 
 echo "[INFO] Training $TASK with $NUM_ENVS envs on $MOTION_FILE, wall $WALL"

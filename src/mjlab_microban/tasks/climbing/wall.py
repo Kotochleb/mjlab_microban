@@ -33,7 +33,8 @@ from __future__ import annotations
 
 import json
 import sys
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 
@@ -82,6 +83,44 @@ POSTS_BODY = "hold_posts"
 FIVE_BOX_WORLD_BOXES = ("lip", "front_post")
 # 5-box cup boxes in the FEET group (besides HANDLES): the floor of the cup.
 FIVE_BOX_FEET_BOXES = ("ledge",)
+
+# The 5-box cups the used holds collide as: name -> (boxes on the "wall" body, posts on POSTS_BODY).
+#   five_box         the current cup (hold_boxes.FIVE_BOX: trimmed, tilted lip and sides, plus the upright posts)
+#   five_box_legacy  the cup before git 20a0573 (hold_boxes.FIVE_BOX_LEGACY: five upright boxes, no posts)
+FIVE_BOX_CUPS: dict[str, tuple[tuple[hold_boxes.Box, ...], tuple[hold_boxes.Box, ...]]] = {
+    "five_box": (hold_boxes.FIVE_BOX, hold_boxes.FIVE_BOX_POSTS),
+    "five_box_legacy": (hold_boxes.FIVE_BOX_LEGACY, ()),
+}
+DEFAULT_FIVE_BOX_CUP = "five_box"
+_five_box_cup = DEFAULT_FIVE_BOX_CUP  # the cup the wall specs are built with (see five_box_cup)
+
+
+@contextmanager
+def five_box_cup(name: str):
+    """Build the wall specs with the 5-box cup ``name`` (FIVE_BOX_CUPS) inside this block."""
+    global _five_box_cup
+    if name not in FIVE_BOX_CUPS:
+        raise ValueError(f"unknown 5-box cup {name!r}; known: {sorted(FIVE_BOX_CUPS)}")
+    previous, _five_box_cup = _five_box_cup, name
+    try:
+        yield
+    finally:
+        _five_box_cup = previous
+
+
+def with_five_box_cup(cfg: EntityCfg, name: str) -> EntityCfg:
+    """The wall entity ``cfg`` (make_wall_cfg, multi_board.make_multi_board_wall_cfg), its used holds built as the
+    5-box cup ``name`` (FIVE_BOX_CUPS)."""
+    if name not in FIVE_BOX_CUPS:
+        raise ValueError(f"unknown 5-box cup {name!r}; known: {sorted(FIVE_BOX_CUPS)}")
+    base_spec_fn = cfg.spec_fn
+
+    def spec_fn() -> mujoco.MjSpec:
+        with five_box_cup(name):
+            return base_spec_fn()
+
+    return replace(cfg, spec_fn=spec_fn)
+
 
 # Wall JSON files of this project (climbing_sim form), loaded by name (their file stem), see wall_file.
 WALLS_DIR = Path(__file__).parent / "boards" / "walls"
@@ -398,9 +437,10 @@ def _add_board(body, blocks_body, posts_body, spec: WallSpec, used: frozenset[in
             material="wall_hold",
         )
         if used is None or k in used:
-            _add_hold_boxes(body, name, socket, hold_boxes.FIVE_BOX, friction, rgba=[0.25, 0.55, 0.95, 1],
+            cup, posts = FIVE_BOX_CUPS[_five_box_cup]
+            _add_hold_boxes(body, name, socket, cup, friction, rgba=[0.25, 0.55, 0.95, 1],
                             conaffinity=_five_box_conaffinity)
-            _add_hold_boxes(posts_body, name, socket, hold_boxes.FIVE_BOX_POSTS, friction, rgba=[0.25, 0.55, 0.95, 1],
+            _add_hold_boxes(posts_body, name, socket, posts, friction, rgba=[0.25, 0.55, 0.95, 1],
                             conaffinity=_five_box_conaffinity)
         else:
             _add_hold_boxes(blocks_body, name, socket, hold_boxes.ONE_BOX, friction, rgba=[0.7, 0.3, 0.85, 1],

@@ -624,6 +624,14 @@ def set_bam_kp(asset: Entity, kp: float | torch.Tensor) -> None:
         act.kp_scale[:] = kp / float(act._bam_model.actuator.kp)
 
 
+def bam_nominal_kp(asset: Entity) -> torch.Tensor:
+    """Nominal firmware P gain (kp_fw units) of each env, shape [B]: the one randomize_pd_gain draws around, or the
+    current one (bam_kp) without that randomisation. What the controller believes the gain is."""
+    act = _bam_actuators(asset)[0]
+    nominal = getattr(act, "kp_nominal", None)
+    return nominal if nominal is not None else bam_kp(asset)
+
+
 def bam_stiffness_and_effort_limit(act: BamActuator) -> tuple[float, float]:
     """(stiffness per unit kp_fw [Nm/rad], effort limit [Nm]) of a BAM actuator, at its nominal voltage.
 
@@ -648,6 +656,29 @@ def set_pd_gain(
 ) -> None:
     """Set the firmware P gain (kp_fw units) of all BAM actuators, for all envs (startup event)."""
     set_bam_kp(env.scene[asset_cfg.name], kp)
+
+
+def randomize_pd_gain(
+    env: ManagerBasedRlEnv,
+    env_ids: torch.Tensor | slice | None,
+    kp: float,
+    rel_range: float,
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> None:
+    """Set the firmware P gain (kp_fw units) of every BAM-actuated joint to kp * U(1 - rel_range, 1 + rel_range),
+    drawn per env and joint (startup event, in place of set_pd_gain).
+
+    Only the physics see the drawn gains: the residual action scale (ResidualJointPositionAction) keeps using the
+    nominal ``kp`` (bam_nominal_kp), as the deployed controller does, so the policy cannot read the gain from it."""
+    asset = env.scene[asset_cfg.name]
+    num_envs = env.num_envs
+    for act in _bam_actuators(asset):
+        num_joints = len(act._dof_ids)
+        u = torch.empty(num_envs, num_joints, device=env.device).uniform_(1.0 - rel_range, 1.0 + rel_range)
+        # kp_scale is [B, 1] by default; BAM broadcasts it against the [B, J] position error, so [B, J] works too.
+        act.kp_scale = u * (kp / float(act._bam_model.actuator.kp))
+        act.default_kp_scale = act.kp_scale.clone()
+        act.kp_nominal = torch.full((num_envs,), float(kp), device=env.device)
 
 
 class bam_power_curriculum:
@@ -699,7 +730,8 @@ class bam_power_curriculum:
         asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
     ) -> dict[str, float]:
         del env_ids, asset_cfg
-        alpha = min(max(env.common_step_counter / num_steps, 0.0), 1.0)
+        # num_steps <= 0: at the realistic power from the start (e.g. fine-tuning a trained policy).
+        alpha = min(max(env.common_step_counter / num_steps, 0.0), 1.0) if num_steps > 0 else 1.0
         for act, vin_final, max_current_final in zip(
             self._acts, self._vin_final, self._max_current_final, strict=True
         ):
@@ -1599,7 +1631,7 @@ class ResidualJointPositionAction(JointPositionAction):
 
     def process_actions(self, actions: torch.Tensor) -> None:
         if self.cfg.stiffness_scale is not None:
-            stiffness = self._stiffness_per_kp * bam_kp(self._entity)  # [B] Nm/rad
+            stiffness = self._stiffness_per_kp * bam_nominal_kp(self._entity)  # [B] Nm/rad
             self._scale = (self.cfg.stiffness_scale * self._effort_limit / stiffness).unsqueeze(-1)
         super().process_actions(actions)
 

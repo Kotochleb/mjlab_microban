@@ -20,6 +20,7 @@ from mjlab_microban.tasks.climbing.microban_climbing_multi_board_env_cfg import 
     make_microban_climbing_multi_board_env_cfg,
 )
 from mjlab_microban.tasks.climbing.microban_climbing_adaptive_phase_env_cfg import adaptive_phase_base_fn
+from mjlab_microban.tasks.climbing.microban_climbing_finetune_env_cfg import to_finetune
 from mjlab_microban.tasks.climbing.rl_cfg import (
     MicrobanClimbingConv1dHistoryRlCfg,
     MicrobanClimbingConv1dRlCfg,
@@ -97,6 +98,15 @@ for _suffix, _base_fn, _rl_cfg in (
         rl_cfg=_ap_rl_cfg,
         runner_cls=MotionTrackingOnPolicyRunner,
     )
+    # Fine-tuning (microban_climbing_finetune_env_cfg.py): legacy 5-box cups, curricula at their final values,
+    # randomised P gain; resumed from a trained checkpoint (scripts/finetune_climbing.sh).
+    register_mjlab_task(
+        task_id=f"Mjlab-Climbing-Microban-Adaptive-Phase{_suffix}-Finetune",
+        env_cfg=to_finetune(_ap_fn()),
+        play_env_cfg=to_finetune(_ap_fn(play=True), play=True),
+        rl_cfg=replace(_ap_rl_cfg, experiment_name=f"{_ap_rl_cfg.experiment_name}_finetune"),
+        runner_cls=MotionTrackingOnPolicyRunner,
+    )
     try:
         _env_cfg = make_microban_climbing_multi_board_env_cfg(base_fn=_ap_fn)
         _play_env_cfg = make_microban_climbing_multi_board_env_cfg(play=True, base_fn=_ap_fn)
@@ -108,5 +118,12 @@ for _suffix, _base_fn, _rl_cfg in (
         env_cfg=_env_cfg,
         play_env_cfg=_play_env_cfg,
         rl_cfg=replace(_ap_rl_cfg, experiment_name=f"{_ap_rl_cfg.experiment_name}_multi_board"),
+        runner_cls=MotionTrackingOnPolicyRunner,
+    )
+    register_mjlab_task(
+        task_id=f"Mjlab-Climbing-Microban-Adaptive-Phase-Multi-Board{_suffix}-Finetune",
+        env_cfg=to_finetune(make_microban_climbing_multi_board_env_cfg(base_fn=_ap_fn)),
+        play_env_cfg=to_finetune(make_microban_climbing_multi_board_env_cfg(play=True, base_fn=_ap_fn), play=True),
+        rl_cfg=replace(_ap_rl_cfg, experiment_name=f"{_ap_rl_cfg.experiment_name}_multi_board_finetune"),
         runner_cls=MotionTrackingOnPolicyRunner,
     )

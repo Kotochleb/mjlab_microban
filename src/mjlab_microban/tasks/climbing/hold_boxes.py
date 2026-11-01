@@ -234,4 +234,28 @@ BLOCK = Box(
 )
 ONE_BOX: tuple[Box, ...] = (BLOCK,)
 
-APPROXIMATIONS: dict[str, tuple[Box, ...]] = {"three_box": THREE_BOX, "five_box": FIVE_BOX + FIVE_BOX_POSTS, "one_box": ONE_BOX}
+# Legacy five boxes (git 8156523 and before 20a0573): the three boxes plus the two sides, upright, untrimmed and
+# without posts; the lip, back and sides thinned by FIVE_BOX_THINNING on their inner faces (0.6 mm gap all around
+# the ball), the ledge kept whole. Same box names as FIVE_BOX, so wall.py gives them the same collision groups.
+FIVE_BOX_LEGACY: tuple[Box, ...] = (
+    LEDGE,
+    Box("lip", lo=LIP.lo, hi=(LIP.hi[0], LIP.hi[1] - FIVE_BOX_THINNING, LIP.hi[2])),
+    Box("back", lo=(BACK.lo[0], BACK.lo[1] + FIVE_BOX_THINNING, BACK.lo[2]), hi=BACK.hi),
+    Box(
+        "side_pos_x",
+        lo=(HOLD_HALF_WIDTH - SIDE_THICKNESS, HOLD_FRONT_Y, HOLD_BOTTOM_Z),
+        hi=(HOLD_HALF_WIDTH, HOLD_BACK_Y, BACK_TOP_Z),
+    ),
+    Box(
+        "side_neg_x",
+        lo=(-HOLD_HALF_WIDTH, HOLD_FRONT_Y, HOLD_BOTTOM_Z),
+        hi=(-HOLD_HALF_WIDTH + SIDE_THICKNESS, HOLD_BACK_Y, BACK_TOP_Z),
+    ),
+)
+
+APPROXIMATIONS: dict[str, tuple[Box, ...]] = {
+    "three_box": THREE_BOX,
+    "five_box": FIVE_BOX + FIVE_BOX_POSTS,
+    "five_box_legacy": FIVE_BOX_LEGACY,
+    "one_box": ONE_BOX,
+}
