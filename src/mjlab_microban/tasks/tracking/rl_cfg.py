@@ -47,7 +47,7 @@ MicrobanTrackingRlCfg = RslRlOnPolicyRunnerCfg(
     ),
     wandb_project="mjlab_microban_tracking",
     experiment_name="mjlab_microban_tracking",
-    save_interval=500,
+    save_interval=100,
     num_steps_per_env=24,
     max_iterations=30_000,
 )

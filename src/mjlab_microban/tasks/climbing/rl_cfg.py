@@ -66,7 +66,7 @@ MicrobanClimbingRlCfg = RslRlOnPolicyRunnerCfg(
     ),
     wandb_project="mjlab_microban_climbing",
     experiment_name="mjlab_microban_climbing_residual",
-    save_interval=500,
+    save_interval=100,
     num_steps_per_env=24,
     max_iterations=30_000,
 )
