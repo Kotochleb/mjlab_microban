@@ -441,7 +441,7 @@ def make_microban_climbing_env_cfg(
     #---------------------------- Rewards ---------------------------
     # Imitation: DeepMimic's reward (Peng et al., SIGGRAPH 2018), the standard reward for policies tracking
     # a reference motion, used e.g. with residual (reference + correction) actions in Xie et al., "Feedback
-    # control for Cassie with deep RL" (IROS 2018). Weights 0.65 / 0.1 / 0.15 / 0.1 (x10) and kernels
+    # control for Cassie with deep RL" (IROS 2018). Weights 0.65 / 0.1 / 0.15 / 0.1 (x15) and kernels
     # exp(-k * e) with k = 2 / 0.1 / - / 10; the root kernel is rescaled by (1 / DEEPMIMIC_LENGTH_SCALE)^2 for
     # Microban's size (centre of mass: the trunk). The end effectors are the balls, which go into the holds:
     # their kernel is set by the placement accuracy wanted, BALL_POS_STD (5 mm) per ball.
@@ -450,14 +450,14 @@ def make_microban_climbing_env_cfg(
     length_k = 1.0 / DEEPMIMIC_LENGTH_SCALE**2
     cfg.rewards = {
         "pose": RewardTermCfg(
-            func=mdp.deepmimic_pose_exp, weight=6.5, params={"command_name": "motion", "k": 2.0}
+            func=mdp.deepmimic_pose_exp, weight=9.75, params={"command_name": "motion", "k": 2.0}
         ),
         "velocity": RewardTermCfg(
-            func=mdp.deepmimic_velocity_exp, weight=1.0, params={"command_name": "motion", "k": 0.1}
+            func=mdp.deepmimic_velocity_exp, weight=1.5, params={"command_name": "motion", "k": 0.1}
         ),
         "end_effector": RewardTermCfg(
             func=mdp.ball_position_error_exp,
-            weight=1.5,
+            weight=2.25,
             params={
                 "command_name": "motion",
                 "std": BALL_POS_STD,
@@ -467,7 +467,7 @@ def make_microban_climbing_env_cfg(
         ),
         "root_position": RewardTermCfg(
             func=mdp.deepmimic_root_position_exp,
-            weight=1.0,
+            weight=1.5,
             params={"command_name": "motion", "k": 10.0 * length_k},
         ),
         "residual_l2": RewardTermCfg(func=mdp.residual_action_l2, weight=-0.01),
@@ -516,7 +516,7 @@ def make_microban_climbing_env_cfg(
         # wall's top) while the reference expects it on a hold over the previous and next BALL_IN_HOLD_WINDOW steps.
         "ball_in_hold": RewardTermCfg(
             func=mdp.ball_in_hold_contact,
-            weight=0.5,
+            weight=1.0,
             params={
                 "sensor_name": ball_hold_contact_sensor_cfg.name,
                 "command_name": "motion",
