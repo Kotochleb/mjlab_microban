@@ -40,6 +40,7 @@ from mjlab_microban.tasks.climbing.wall import with_five_box_cup
 FINETUNE_FIVE_BOX_CUP = "five_box_legacy"
 KP_REL_RANGE = 0.10
 FINETUNE_INIT_STD = 0.45
+FINETUNE_SAVE_INTERVAL = 100  # PPO iterations between saved checkpoints (model_<it>.pt)
 FINETUNE_PHASE_LEVEL_INIT = 0.5
 FINETUNE_PHASE_LEVEL_STEP = 0.125
 FINETUNE_PHASE_LEVEL_UP = 0.97

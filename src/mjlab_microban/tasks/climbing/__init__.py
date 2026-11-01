@@ -20,7 +20,11 @@ from mjlab_microban.tasks.climbing.microban_climbing_multi_board_env_cfg import 
     make_microban_climbing_multi_board_env_cfg,
 )
 from mjlab_microban.tasks.climbing.microban_climbing_adaptive_phase_env_cfg import adaptive_phase_base_fn
-from mjlab_microban.tasks.climbing.microban_climbing_finetune_env_cfg import FinetuneRunner, to_finetune
+from mjlab_microban.tasks.climbing.microban_climbing_finetune_env_cfg import (
+    FINETUNE_SAVE_INTERVAL,
+    FinetuneRunner,
+    to_finetune,
+)
 from mjlab_microban.tasks.climbing.rl_cfg import (
     MicrobanClimbingConv1dHistoryRlCfg,
     MicrobanClimbingConv1dRlCfg,
@@ -105,7 +109,11 @@ for _suffix, _base_fn, _rl_cfg in (
         task_id=f"Mjlab-Climbing-Microban-Adaptive-Phase{_suffix}-Finetune",
         env_cfg=to_finetune(_ap_fn()),
         play_env_cfg=to_finetune(_ap_fn(play=True), play=True),
-        rl_cfg=replace(_ap_rl_cfg, experiment_name=f"{_ap_rl_cfg.experiment_name}_finetune"),
+        rl_cfg=replace(
+            _ap_rl_cfg,
+            experiment_name=f"{_ap_rl_cfg.experiment_name}_finetune",
+            save_interval=FINETUNE_SAVE_INTERVAL,
+        ),
         runner_cls=FinetuneRunner,
     )
     try:
@@ -125,6 +133,10 @@ for _suffix, _base_fn, _rl_cfg in (
         task_id=f"Mjlab-Climbing-Microban-Adaptive-Phase-Multi-Board{_suffix}-Finetune",
         env_cfg=to_finetune(make_microban_climbing_multi_board_env_cfg(base_fn=_ap_fn)),
         play_env_cfg=to_finetune(make_microban_climbing_multi_board_env_cfg(play=True, base_fn=_ap_fn), play=True),
-        rl_cfg=replace(_ap_rl_cfg, experiment_name=f"{_ap_rl_cfg.experiment_name}_multi_board_finetune"),
+        rl_cfg=replace(
+            _ap_rl_cfg,
+            experiment_name=f"{_ap_rl_cfg.experiment_name}_multi_board_finetune",
+            save_interval=FINETUNE_SAVE_INTERVAL,
+        ),
         runner_cls=FinetuneRunner,
     )
