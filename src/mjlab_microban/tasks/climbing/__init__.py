@@ -20,7 +20,7 @@ from mjlab_microban.tasks.climbing.microban_climbing_multi_board_env_cfg import 
     make_microban_climbing_multi_board_env_cfg,
 )
 from mjlab_microban.tasks.climbing.microban_climbing_adaptive_phase_env_cfg import adaptive_phase_base_fn
-from mjlab_microban.tasks.climbing.microban_climbing_finetune_env_cfg import to_finetune
+from mjlab_microban.tasks.climbing.microban_climbing_finetune_env_cfg import FinetuneRunner, to_finetune
 from mjlab_microban.tasks.climbing.rl_cfg import (
     MicrobanClimbingConv1dHistoryRlCfg,
     MicrobanClimbingConv1dRlCfg,
@@ -98,14 +98,15 @@ for _suffix, _base_fn, _rl_cfg in (
         rl_cfg=_ap_rl_cfg,
         runner_cls=MotionTrackingOnPolicyRunner,
     )
-    # Fine-tuning (microban_climbing_finetune_env_cfg.py): legacy 5-box cups, curricula at their final values,
-    # randomised P gain; resumed from a trained checkpoint (scripts/finetune_climbing.sh).
+    # Fine-tuning (microban_climbing_finetune_env_cfg.py): legacy 5-box cups, curricula at their final values, a
+    # lower adaptive phase level, randomised P gain, policy std reset to 0.45; resumed from a trained checkpoint
+    # (scripts/train_climbing.sh --finetune).
     register_mjlab_task(
         task_id=f"Mjlab-Climbing-Microban-Adaptive-Phase{_suffix}-Finetune",
         env_cfg=to_finetune(_ap_fn()),
         play_env_cfg=to_finetune(_ap_fn(play=True), play=True),
         rl_cfg=replace(_ap_rl_cfg, experiment_name=f"{_ap_rl_cfg.experiment_name}_finetune"),
-        runner_cls=MotionTrackingOnPolicyRunner,
+        runner_cls=FinetuneRunner,
     )
     try:
         _env_cfg = make_microban_climbing_multi_board_env_cfg(base_fn=_ap_fn)
@@ -125,5 +126,5 @@ for _suffix, _base_fn, _rl_cfg in (
         env_cfg=to_finetune(make_microban_climbing_multi_board_env_cfg(base_fn=_ap_fn)),
         play_env_cfg=to_finetune(make_microban_climbing_multi_board_env_cfg(play=True, base_fn=_ap_fn), play=True),
         rl_cfg=replace(_ap_rl_cfg, experiment_name=f"{_ap_rl_cfg.experiment_name}_multi_board_finetune"),
-        runner_cls=MotionTrackingOnPolicyRunner,
+        runner_cls=FinetuneRunner,
     )

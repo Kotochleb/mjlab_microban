@@ -37,9 +37,10 @@
 # Fine-tune flags (resume a trained policy and keep training it; tasks/climbing/microban_climbing_finetune_env_cfg.py):
 #   --finetune              train the -Finetune variant of the task: the used holds collide as the legacy 5-box cup
 #                           (five upright boxes, no trims / tilts / posts, before git 20a0573), every curriculum
-#                           starts at its final value (full DR ranges, realistic motor power, adaptive phase level 1,
-#                           all board levels, maximum board horizons), and the firmware P gain is drawn per env and
-#                           joint in 120 * [0.9, 1.1]. Implies --adaptive-phase and --multi-board (the task of the
+#                           starts at its final value (full DR ranges, realistic motor power, all board levels,
+#                           maximum board horizons), the adaptive phase level (regularisation penalties) starts at
+#                           0.5 and rises slowly, the policy std is reset to 0.45, and the firmware P gain is drawn
+#                           per env and joint in 120 * [0.9, 1.1]. Implies --adaptive-phase and --multi-board (the task of the
 #                           default run; set TASK=...-Finetune for another one). Without --play: training resumes from
 #                           the last checkpoint of --finetune-from (default: $FINETUNE_FROM, or
 #                           kotochleb-cnrs-laas/mjlab_microban_climbing/cp4zxscz, trained on
