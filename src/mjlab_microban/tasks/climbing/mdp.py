@@ -14,12 +14,20 @@ import warp as wp
 
 from bam.mjlab import BamActuator
 from mjlab.entity import Entity
+from mjlab.envs import mdp as envs_mdp
 from mjlab.envs.mdp.actions import JointPositionAction, JointPositionActionCfg
 from mjlab.managers.event_manager import requires_model_fields
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.sensor import ContactSensor, TerrainHeightSensor
 from mjlab.tasks.tracking.mdp import MotionCommand, MotionCommandCfg
-from mjlab.utils.lab_api.math import matrix_from_quat, quat_apply, quat_error_magnitude, quat_inv, quat_mul
+from mjlab.utils.lab_api.math import (
+    matrix_from_quat,
+    quat_apply,
+    quat_error_magnitude,
+    quat_inv,
+    quat_mul,
+    sample_uniform,
+)
 
 from mjlab_microban.tasks.climbing import hold_boxes
 from mjlab_microban.tasks.climbing.wall import SIM_TO_ENV_ROT, contact_plan_file, planned_contacts
@@ -926,6 +934,113 @@ def shorten_box_geom(
     # Broadphase bounds of a box: half sizes (aabb, centered) and their norm (rbound).
     env.sim.model.geom_aabb[env_grid, geom_grid, 1] = size
     env.sim.model.geom_rbound[env_grid, geom_grid] = size.norm(dim=-1)
+
+
+class contact_scaled_body_impulse(envs_mdp.apply_body_impulse):
+    """mjlab's apply_body_impulse (a constant wrench held ``duration_s``, then a ``cooldown_s`` pause, per env), its
+    size set by how many balls the reference expects on holds at the current motion frame.
+
+    When the impulse starts, a force and a torque are sampled uniformly in [-1, 1] per component; every step while it
+    lasts, the applied wrench is that sample times ``force_limits[n]`` [N] / ``torque_limits[n]`` [N.m], n the number
+    of expected contacts now (mdp.motion_contact_schedule's ``contact``, at motion_frames_ahead's current frame). The
+    defaults: up to 1 N / 0.5 N.m per axis with all four balls expected on holds, 0.35 N / 0.175 N.m (about a
+    third) with three, 0.1 N / 0.05 N.m (a tenth) with fewer. A push started on four contacts drops as soon as the
+    reference lifts a ball.
+
+    The schedule is the observation term ``schedule_term`` (looked up on the first call: the event manager is built
+    before the observation manager), so the single- and multi-board schedules are both used as they are.
+    """
+
+    def __init__(self, cfg, env: ManagerBasedRlEnv):
+        super().__init__(cfg, env)
+        self._unit_forces = torch.zeros(self._num_envs, self._num_bodies, 3, device=self._device)
+        self._unit_torques = torch.zeros_like(self._unit_forces)
+        self._unit_offset_torques = torch.zeros_like(self._unit_forces)  # offset x unit force (body_point_offset)
+        self._expected: torch.Tensor | None = None  # [T, N], from the schedule term on the first call
+        self._limits: torch.Tensor | None = None  # [2, N + 1]: force, torque limit per number of expected contacts
+
+    def _contact_limits(
+        self,
+        env: ManagerBasedRlEnv,
+        command_name: str,
+        schedule_term: tuple[str, str],
+        force_limits: tuple[float, ...],
+        torque_limits: tuple[float, ...],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """[B] force [N] and torque [N.m] limits from the number of balls the reference expects on holds now."""
+        if self._expected is None:
+            schedule = env.observation_manager.get_term_cfg(*schedule_term)
+            assert isinstance(schedule.func, motion_contact_schedule), "schedule_term is not a motion_contact_schedule"
+            self._expected = schedule.func.contact
+            k = self._expected.shape[1] + 1
+            assert len(force_limits) == k and len(torque_limits) == k, (
+                f"force/torque_limits need {k} entries (0..{k - 1})"
+            )
+            self._limits = torch.tensor([force_limits, torque_limits], dtype=torch.float32, device=self._device)
+        assert self._limits is not None
+        command = cast(MotionCommand, env.command_manager.get_term(command_name))
+        frame = motion_frames_ahead(command, torch.zeros(1, dtype=torch.long, device=self._device))[:, 0]  # [B]
+        n = self._expected[frame].sum(dim=-1).long()  # [B]
+        return self._limits[0, n], self._limits[1, n]
+
+    def __call__(
+        self,
+        env: ManagerBasedRlEnv,
+        env_ids: torch.Tensor | None,
+        duration_s: tuple[float, float],
+        cooldown_s: tuple[float, float],
+        asset_cfg: SceneEntityCfg,
+        command_name: str = "motion",
+        force_limits: tuple[float, ...] = (0.1, 0.1, 0.1, 0.35, 1.0),
+        torque_limits: tuple[float, ...] = (0.05, 0.05, 0.05, 0.175, 0.5),
+        schedule_term: tuple[str, str] = ("critic", "motion_contact_schedule"),
+        body_point_offset: tuple[float, float, float] | None = None,
+    ) -> None:
+        del env_ids, asset_cfg  # step events act on all envs; bodies from __init__
+        dt = self._step_dt
+        self._time_remaining[self._active] -= dt
+
+        # Expired impulses: off, cooldown resampled.
+        expired = self._active & (self._time_remaining <= 0)
+        if expired.any():
+            ids = expired.nonzero(as_tuple=False).squeeze(-1)
+            zeros = torch.zeros((len(ids), self._num_bodies, 3), device=self._device)
+            self._asset.write_external_wrench_to_sim(zeros, zeros, env_ids=ids, body_ids=self._body_ids)
+            self._active[ids] = False
+            self._time_remaining[ids] = 0.0
+            self._interval_time_left[ids] = sample_uniform(*cooldown_s, (len(ids),), self._device)
+
+        # New impulses: unit wrench in [-1, 1] (plus the off-CoM torque), duration and next cooldown.
+        self._interval_time_left -= dt
+        eligible = (~self._active) & (self._interval_time_left <= 0)
+        if eligible.any():
+            ids = eligible.nonzero(as_tuple=False).squeeze(-1)
+            n = len(ids)
+            size = (n, self._num_bodies, 3)
+            forces = sample_uniform(-1.0, 1.0, size, self._device)
+            self._unit_forces[ids] = forces
+            self._unit_torques[ids] = sample_uniform(-1.0, 1.0, size, self._device)
+            if body_point_offset is not None:
+                offset = torch.tensor(body_point_offset, device=self._device, dtype=torch.float32)
+                body_quat = self._asset.data.body_com_quat_w[ids][:, self._body_ids]
+                offset_w = quat_apply(body_quat.reshape(-1, 4), offset.expand(n * self._num_bodies, 3)).view(size)
+                self._unit_offset_torques[ids] = torch.cross(offset_w, forces, dim=-1)
+            else:
+                self._unit_offset_torques[ids] = 0.0
+            self._time_remaining[ids] = sample_uniform(*duration_s, (n,), self._device)
+            self._interval_time_left[ids] = sample_uniform(*cooldown_s, (n,), self._device)
+            self._active[ids] = True
+
+        # Active impulses: the unit wrench times the limits for the expected contacts now.
+        if not self._active.any():
+            return
+        ids = self._active.nonzero(as_tuple=False).squeeze(-1)
+        f_lim, t_lim = self._contact_limits(env, command_name, schedule_term, force_limits, torque_limits)
+        f_lim, t_lim = f_lim[ids, None, None], t_lim[ids, None, None]
+        forces = self._unit_forces[ids] * f_lim
+        torques = self._unit_torques[ids] * t_lim + self._unit_offset_torques[ids] * f_lim
+        self._asset.write_external_wrench_to_sim(forces, torques, env_ids=ids, body_ids=self._body_ids)
+        env.extras.setdefault("log", {})["Metrics/perturbation_force_limit"] = f_lim.mean()
 
 
 def bam_torque_utilisation(env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG) -> torch.Tensor:

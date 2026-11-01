@@ -590,16 +590,19 @@ def make_microban_climbing_env_cfg(
     }
 
     # Random pushes on the trunk (the robot weighs ~0.81 kg, ~8 N): a constant wrench of up to
-    # 4 N / 2 N.m per axis, held 0.05-0.2 s, every 1-2 s, per env.
+    # 1 N / 0.5 N.m per axis while the reference expects all four balls on holds, 0.35 N / 0.175 N.m (about a third)
+    # with three, 0.1 N / 0.05 N.m (a tenth) with fewer (limits per number of expected contacts 0..4), held
+    # 0.05-0.2 s, every 1-2 s, per env.
     cfg.events["base_perturbation"] = EventTermCfg(
         mode="step",
-        func=envs_mdp.apply_body_impulse,
+        func=mdp.contact_scaled_body_impulse,
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=("trunk",)),
-            "force_range": (-4.0, 4.0),
-            "torque_range": (-2.0, 2.0),
             "duration_s": (0.05, 0.2),
             "cooldown_s": (1.0, 2.0),
+            "command_name": "motion",
+            "force_limits": (0.1, 0.1, 0.1, 0.35, 1.0),
+            "torque_limits": (0.05, 0.05, 0.05, 0.175, 0.5),
         },
     )
 
