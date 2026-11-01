@@ -45,7 +45,7 @@ PHASE_RATE_K = 10.0
 # at 1.73 x it): the phase stops well before the 7 cm terminations, and the reset randomisation (+-1.5 cm) leaves it at 1.
 PHASE_RATE_TOLERANCES = {"balls": 0.025, "trunk_pos": 0.04, "trunk_ori": 0.3}
 
-# Task progress reward: weight (the tracking rewards sum to ~15) and phase lag kernel width.
+# Task progress reward: weight (the tracking rewards sum to ~10) and phase lag kernel width.
 PROGRESS_WEIGHT = 5.0
 PROGRESS_LAG_STD_S = 2.0
 
