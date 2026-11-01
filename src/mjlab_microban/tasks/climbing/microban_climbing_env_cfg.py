@@ -589,15 +589,15 @@ def make_microban_climbing_env_cfg(
         2: (-0.005, 0.005),
     }
 
-    # Very small random pushes on the trunk (the robot weighs ~0.81 kg, ~8 N): a constant wrench of up to
-    # 0.2 N / 0.01 N.m per axis, held 0.05-0.2 s, every 1-2 s, per env.
+    # Random pushes on the trunk (the robot weighs ~0.81 kg, ~8 N): a constant wrench of up to
+    # 4 N / 2 N.m per axis, held 0.05-0.2 s, every 1-2 s, per env.
     cfg.events["base_perturbation"] = EventTermCfg(
         mode="step",
         func=envs_mdp.apply_body_impulse,
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=("trunk",)),
-            "force_range": (-0.2, 0.2),
-            "torque_range": (-0.01, 0.01),
+            "force_range": (-4.0, 4.0),
+            "torque_range": (-2.0, 2.0),
             "duration_s": (0.05, 0.2),
             "cooldown_s": (1.0, 2.0),
         },
@@ -662,16 +662,16 @@ def make_microban_climbing_env_cfg(
                 "full_steps": 500 * 24,
             },
         )
-        # Reference motion speed, per env and episode: U(0.95, 1.05) up to iteration 500, then the bounds widen
-        # linearly to U(0.9, 1.5) at iteration 1500.
+        # Reference motion speed, per env and episode: U(0.95, 1.05) up to iteration 200, then the bounds widen
+        # linearly to U(0.4, 1.7) at iteration 800.
         cfg.curriculum["motion_speed"] = CurriculumTermCfg(
             func=mdp.motion_speed_curriculum,
             params={
                 "command_name": "motion",
                 "start_range": (0.95, 1.05),
-                "full_range": (0.9, 1.5),
-                "hold_steps": 500 * 24,
-                "full_steps": 1500 * 24,
+                "full_range": (0.4, 1.7),
+                "hold_steps": 200 * 24,
+                "full_steps": 800 * 24,
             },
         )
         # robot_stuck penalty: off up to iteration 200, then its weight rises linearly from 0 to the full one at
