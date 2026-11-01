@@ -9,7 +9,7 @@ adaptive_phase.py): any climbing env config (single board, Conv1d, Conv1d-Histor
 climb's phase advances at a rate set by how well the robot tracks it, plus a policy residual on that rate.
 
 On top of the base env:
-  - actions: one more, the phase rate residual dv (last in the action vector), v = v_ref + 0.1 * clip(dv, +-2);
+  - actions: one more, the phase rate residual dv (last in the action vector), v = v_ref + 0.25 * clip(dv, +-6);
   - observations: the phase phi (normalised over the climb) and v_ref, for actor and critic; the critic also gets
     the phase lag behind the nominal phase (the progress reward depends on it);
   - rewards: the task progress reward v_ref * exp(-(lag / 2 s)^2);
@@ -31,12 +31,14 @@ from mjlab_microban.robot.microban_climb_constants import BALL_SITE_NAMES
 from mjlab_microban.tasks.climbing import adaptive_phase
 from mjlab_microban.tasks.climbing.microban_climbing_env_cfg import make_microban_climbing_env_cfg
 
-# sigma_1 and k of the paper. sigma_1 is 10x the paper's 0.01: at 0.01, noise on dv barely changes the return, so PPO
+# sigma_1 and k of the paper. sigma_1 is 25x the paper's 0.01: at 0.01, noise on dv barely changes the return, so PPO
 # gets no signal on dv's std (which the entropy bonus then inflates) and the policy can hardly move a stalled phase.
-# Stalling still takes dv = -v_ref / sigma_1 = -10, beyond the clip: the policy can slow the phase to 0.8x, not stop it.
-PHASE_RATE_SCALE = 0.1
-# dv is clipped to +-PHASE_DELTA_CLIP: the phase rate moves by at most +-0.2 around v_ref.
-PHASE_DELTA_CLIP = 2.0
+# At 0.25, stalling the phase takes dv = -v_ref / sigma_1 = -4, within reach of an action of order 1.
+PHASE_RATE_SCALE = 0.25
+# dv is clipped to +-PHASE_DELTA_CLIP: the phase rate moves by at most +-1.5 around v_ref. As in the paper, the policy
+# can go back in time to retry a move (e.g. after losing a hold): down to -1.5x the nominal speed when v_ref = 0,
+# -0.5x when tracking well; and catch up at up to 2.5x.
+PHASE_DELTA_CLIP = 6.0
 PHASE_RATE_K = 10.0
 
 # Tracking tolerances of the reference phase rate's factors (each is 1 within its tolerance, 0.1 at 1.41 x it, 0.01
