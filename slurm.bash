@@ -2,7 +2,7 @@
 #SBATCH --job-name=mjlab_microban_climbing
 #SBATCH --output=logs/%A_%a/log.out
 #SBATCH --error=logs/%A_%a/log.err
-#SBATCH --array=0-1
+#SBATCH --array=0-3
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
@@ -32,29 +32,39 @@ export TMPDIR=$WORK/.tmp
 # task trains one policy on one wall. Override with TASK=... sbatch slurm.bash.
 TASK="${TASK:-Mjlab-Climbing-Microban-Adaptive-Phase}"
 
-# One array task per wall; keep --array above equal to 0-(N-1). Each wall has its own JSON file in
-# src/mjlab_microban/tasks/climbing/boards/walls/<wall>.json and a planned climb in
-# src/mjlab_microban/motion/multi_board/<wall>.npz (scripts/make_multi_board_motions.py).
-# l2_s3.json has no planned motion yet; add it here once it has one.
-WALLS=(
-  "gen_l3_s0"
-  "gen_l3_s1"
-)
-
-if [[ "${SLURM_ARRAY_TASK_ID}" -ge "${#WALLS[@]}" ]]; then
-  echo "SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID} but only ${#WALLS[@]} walls; fix --array" >&2
+# One array task per wall JSON file in src/mjlab_microban/tasks/climbing/boards/walls/<wall>.json, in
+# sorted order, then the level 1 wall l1s0. Each JSON wall also needs a planned climb in
+# src/mjlab_microban/motion/multi_board/<wall>.npz (scripts/make_multi_board_motions.py); a task whose
+# wall has none fails before training. l1s0 has no wall JSON: the env reads its wall from its motion,
+# src/mjlab_microban/motion/l1s0.npz. WALLS and MOTION_FILES are parallel arrays. --array cannot be
+# computed, so keep it equal to 0-(N-1) for N walls (wall JSON files + 1), or override it at submission:
+#   sbatch --array=0-$(ls src/mjlab_microban/tasks/climbing/boards/walls/*.json | wc -l) slurm.bash
+WALLS_DIR="src/mjlab_microban/tasks/climbing/boards/walls"
+MOTIONS_DIR="src/mjlab_microban/motion"
+shopt -s nullglob
+WALL_FILES=("${WALLS_DIR}"/*.json)
+shopt -u nullglob
+WALLS=()
+MOTION_FILES=()
+for f in "${WALL_FILES[@]}"; do
+  wall="$(basename "${f}" .json)"
+  WALLS+=("${wall}")
+  MOTION_FILES+=("${MOTIONS_DIR}/multi_board/${wall}.npz")
+done
+WALLS+=("l1s0")
+MOTION_FILES+=("${MOTIONS_DIR}/l1s0.npz")
+if [[ "${SLURM_ARRAY_TASK_MAX}" -ne $((${#WALLS[@]} - 1)) ]]; then
+  echo "--array ends at ${SLURM_ARRAY_TASK_MAX} but there are ${#WALLS[@]} walls (${WALLS[*]}); use --array=0-$((${#WALLS[@]} - 1))" >&2
   exit 1
 fi
 
 WALL="${WALLS[$SLURM_ARRAY_TASK_ID]}"
-WALL_FILE="src/mjlab_microban/tasks/climbing/boards/walls/${WALL}.json"
-MOTION_FILE="$(realpath "src/mjlab_microban/motion/multi_board/${WALL}.npz")"
-for f in "${WALL_FILE}" "${MOTION_FILE}"; do
-  if [[ ! -f "${f}" ]]; then
-    echo "Missing ${f} for wall ${WALL}" >&2
-    exit 1
-  fi
-done
+MOTION_FILE="${MOTION_FILES[$SLURM_ARRAY_TASK_ID]}"
+if [[ ! -f "${MOTION_FILE}" ]]; then
+  echo "Missing ${MOTION_FILE} for wall ${WALL}" >&2
+  exit 1
+fi
+MOTION_FILE="$(realpath "${MOTION_FILE}")"
 RUN_NAME="${WALL}"
 # Training is relaunched immediately, at most TRAIN_RETRIES times, but only after an attempt that
 # failed within TRAIN_RETRY_WINDOW seconds of its start; a later failure fails the whole script.
