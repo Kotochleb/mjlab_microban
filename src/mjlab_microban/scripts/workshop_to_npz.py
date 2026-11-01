@@ -181,6 +181,15 @@ def main():
     data["fps"] = np.array([args.output_fps])
     data["used_holds"] = np.array(used_ids)  # planner hold ids (r<row>_c<col>), see tasks/climbing/wall.py
     data["wall"] = np.array(wall.text())  # the wall it was planned on (WallSpec.parse)
+    # Still frames: exact copies of the frame before them in the planner's q (e.g. the settle holds after each move of
+    # rock-climbing-workshop/scripts/cycle_climb.py --settle). The contact plan is timed without them
+    # (wall.planned_contacts). Same fps in and out: the motion's frames are q's.
+    still = np.concatenate([[False], (q[1:] == q[:-1]).all(axis=1)])
+    if still.any():
+        if args.input_fps != args.output_fps:
+            raise SystemExit("[ERROR] a motion with still frames has to keep the planner's fps")
+        data["still_frames"] = still[: motion.output_frames]
+        print(f"[INFO] {int(data['still_frames'].sum())} still frames (copies of the frame before them)")
     args.output_file.parent.mkdir(parents=True, exist_ok=True)
     np.savez(args.output_file, **data)
     print(f"[INFO] Saved {motion.output_frames} frames to {args.output_file}")

@@ -30,7 +30,7 @@ from mjlab.utils.lab_api.math import (
 )
 
 from mjlab_microban.tasks.climbing import hold_boxes
-from mjlab_microban.tasks.climbing.wall import SIM_TO_ENV_ROT, contact_plan_file, planned_contacts
+from mjlab_microban.tasks.climbing.wall import SIM_TO_ENV_ROT, motion_planned_contacts
 
 if TYPE_CHECKING:
     from mjlab.envs import ManagerBasedRlEnv
@@ -371,12 +371,8 @@ def lift_spawn(root_pos: torch.Tensor, dz: float) -> torch.Tensor:
 def full_contact_frames(motion_file: str, num_frames: int, limbs: tuple[str, ...]) -> np.ndarray:
     """[num_frames] bool: the frames where the motion's contact plan has every one of ``limbs`` on a hold (frames
     past the motion's own, e.g. the end hold: its last one)."""
-    plan_file = contact_plan_file(motion_file)
-    if not plan_file.exists():
-        raise FileNotFoundError(f"{plan_file}: no contact plan for {motion_file} (needed by spawn_contact_limbs)")
-    motion_frames = int(np.load(motion_file)["joint_pos"].shape[0])
-    contact = planned_contacts(plan_file, motion_frames, limbs).all(axis=1)
-    return np.concatenate([contact, np.full(num_frames - motion_frames, contact[-1])])
+    contact = motion_planned_contacts(motion_file, limbs).all(axis=1)  # needed by spawn_contact_limbs
+    return np.concatenate([contact, np.full(num_frames - len(contact), contact[-1])])
 
 
 def full_contact_stances(contact: np.ndarray, name: str = "") -> tuple[np.ndarray, np.ndarray]:
@@ -1219,13 +1215,9 @@ class motion_contact_schedule:
             return None
         if source != "plan":
             raise ValueError(f"contact_source must be 'plan' or 'geometry', got {source!r}")
-        plan_file = contact_plan_file(motion_file)
-        if not plan_file.exists():
-            raise FileNotFoundError(f"{plan_file}: no contact plan for {motion_file} (contact_source='plan')")
         limbs = tuple(name.removesuffix("_ball") for name in cfg.params["site_names"])
-        motion_frames = int(np.load(motion_file)["joint_pos"].shape[0])
-        contact = torch.tensor(planned_contacts(plan_file, motion_frames, limbs), device=device)
-        pad = contact[-1:].expand(num_frames - motion_frames, -1)
+        contact = torch.tensor(motion_planned_contacts(motion_file, limbs), device=device)
+        pad = contact[-1:].expand(num_frames - contact.shape[0], -1)
         return torch.cat([contact, pad])
 
     @staticmethod

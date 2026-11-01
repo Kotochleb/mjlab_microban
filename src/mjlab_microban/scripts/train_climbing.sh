@@ -40,8 +40,11 @@
 #                           starts at its final value (full DR ranges, realistic motor power, all board levels,
 #                           maximum board horizons), the adaptive phase level (regularisation penalties) starts at
 #                           0.5 and rises slowly, the policy std is reset to 0.45, and the firmware P gain is drawn
-#                           per env and joint in 120 * [0.9, 1.1]. Implies --adaptive-phase and --multi-board (the task of the
-#                           default run; set TASK=...-Finetune for another one). Without --play: training resumes from
+#                           per env and joint in 120 * [0.9, 1.1]. Implies --adaptive-phase; single board (the
+#                           networks are the same as the multi-board ones), on the given motion, by default
+#                           src/mjlab_microban/motion/l1s0_cycle_settle2.npz (the level 1 wall climbed with a fixed
+#                           gait, 2 s still after each move); --multi-board for the board file instead, or set
+#                           TASK=...-Finetune. Without --play: training resumes from
 #                           the last checkpoint of --finetune-from (default: $FINETUNE_FROM, or
 #                           kotochleb-cnrs-laas/mjlab_microban_climbing/cp4zxscz, trained on
 #                           Mjlab-Climbing-Microban-Adaptive-Phase-Multi-Board). With --play: play a fine-tuned run
@@ -229,7 +232,6 @@ if $FINETUNE; then
     [[ "$TASK" == *-Multi-Board* ]] && MULTI_BOARD=true
   else
     ADAPTIVE_PHASE=true
-    MULTI_BOARD=true
   fi
 fi
 if $DEPLOY; then
@@ -568,6 +570,8 @@ fi
 if [[ $# -ge 1 && "$1" != -* ]]; then
   MOTION_FILE="$(realpath "$1")"
   shift
+elif $FINETUNE; then
+  MOTION_FILE="$REPO_ROOT/src/mjlab_microban/motion/l1s0_cycle_settle2.npz"
 else
   MOTION_FILE="$REPO_ROOT/src/mjlab_microban/motion/l1s0.npz"
 fi

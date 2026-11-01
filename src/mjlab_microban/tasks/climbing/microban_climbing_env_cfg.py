@@ -536,10 +536,12 @@ def make_microban_climbing_env_cfg(
     )
 
     # The balls and capsules are what touches the holds: randomise their friction (the feet's in the tracking
-    # task), sliding coefficient U(0.08, 0.5), shared by all of them in an env. They have priority 1, so this is
-    # the friction of their contacts with the holds (and with the board / floor), not the holds' HOLD_FRICTION.
+    # task), sliding coefficient U(0.08, 1.3), drawn independently for each ball and capsule of each env. They have
+    # priority 1, so this is the friction of their contacts with the holds (and with the board / floor), not the
+    # holds' HOLD_FRICTION.
     cfg.events["foot_friction"].params["asset_cfg"].geom_names = GRIP_GEOM_NAMES
-    cfg.events["foot_friction"].params["ranges"] = (0.08, 0.5)
+    cfg.events["foot_friction"].params["ranges"] = (0.08, 1.3)
+    cfg.events["foot_friction"].params["shared_random"] = False
 
     cfg.events["dof_armature_randomization"] = EventTermCfg(
         mode="startup",

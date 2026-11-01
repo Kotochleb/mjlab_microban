@@ -284,7 +284,9 @@ def contact_plan_file(motion_file: str | Path) -> Path:
     return motion_file.with_name(motion_file.stem + "_plan.json")
 
 
-def planned_contacts(plan_file: str | Path, num_frames: int, limbs: tuple[str, ...]) -> np.ndarray:
+def planned_contacts(
+    plan_file: str | Path, num_frames: int, limbs: tuple[str, ...], still: np.ndarray | None = None
+) -> np.ndarray:
     """The planner's contacts of every motion frame, [num_frames, len(limbs)] bool (limbs: the plan's names,
     e.g. "left_hand").
 
@@ -294,7 +296,15 @@ def planned_contacts(plan_file: str | Path, num_frames: int, limbs: tuple[str, .
     hold in the stance: all frames, except, during the move that changes its hold, from the frame after the move
     starts to the one before it lands. The motion's last frame is the last stance (the climb's end pose, which
     the clamped future windows keep showing). A limb on nothing (None) is not in contact.
+
+    still: [num_frames] bool, the frames that only repeat the one before them (the motion's ``still_frames``, e.g.
+    settle holds inserted after the moves): the plan is timed over the other frames, and a still frame has the
+    contacts of the frame it repeats.
     """
+    if still is not None and still.any():
+        assert len(still) == num_frames and not still[0]
+        compact = planned_contacts(plan_file, int((~still).sum()), limbs)
+        return compact[np.cumsum(~still) - 1]
     data = json.loads(Path(plan_file).read_text())
     if data.get("schema") != CONTACT_PLAN_SCHEMA:
         raise ValueError(f"{plan_file}: expected schema {CONTACT_PLAN_SCHEMA!r}, found {data.get('schema')!r}")
@@ -316,6 +326,18 @@ def planned_contacts(plan_file: str | Path, num_frames: int, limbs: tuple[str, .
             contact[landing] = on[m + 1]
     contact[-1] = on[-1]
     return contact
+
+
+def motion_planned_contacts(motion_file: str | Path, limbs: tuple[str, ...]) -> np.ndarray:
+    """planned_contacts of every frame of a motion, [frames, len(limbs)]: its contact plan (contact_plan_file),
+    timed around its still frames (``still_frames``, if any)."""
+    plan_file = contact_plan_file(motion_file)
+    if not plan_file.exists():
+        raise FileNotFoundError(f"{plan_file}: no contact plan for {motion_file}")
+    motion = np.load(motion_file)
+    num_frames = int(motion["joint_pos"].shape[0])
+    still = motion["still_frames"].astype(bool) if "still_frames" in motion.files else None
+    return planned_contacts(plan_file, num_frames, limbs, still)
 
 
 def hold_indices(spec: WallSpec, ids) -> frozenset[int]:
